@@ -1,0 +1,27 @@
+{
+  "name": "@nexus/shared-utils",
+  "version": "1.0.0",
+  "description": "Shared utilities for Nexus API frontend projects",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "utils",
+    "validation",
+    "nexus"
+  ],
+  "author": "Nexus Team",
+  "license": "MIT",
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.2"
+  }
+}

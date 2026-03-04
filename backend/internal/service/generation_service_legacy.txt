@@ -1,0 +1,581 @@
+// Legacy file: 已迁移到新的 GenerationService 实现（避免编译此文件）
+package service
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"nexus-api/internal/config"
+	"nexus-api/internal/model"
+	"nexus-api/internal/repository"
+	"nexus-api/internal/service/scheduler"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
+)
+
+var (
+	ErrGenerationTaskNotFound  = errors.New("生成任务不存在")
+	ErrGenerationTaskForbidden = errors.New("无权访问此任务")
+)
+
+// GenerationService 生成服务接口
+type GenerationService interface {
+	GenerateImage(ctx context.Context, req *model.ImageGenerationRequest, token *model.Token) (*model.ImageGenerationResponse, error)
+	GenerateVideo(ctx context.Context, req *model.VideoGenerationRequest, token *model.Token) (*model.VideoGenerationResponse, error)
+	GetTaskStatus(ctx context.Context, taskID uuid.UUID, userID uuid.UUID) (*model.GenerationTaskResponse, error)
+	ListUserTasks(ctx context.Context, userID uuid.UUID, taskType model.GenerationType, page, pageSize int) ([]model.GenerationTaskResponse, int64, error)
+}
+
+// generationService 生成服务实现
+type generationService struct {
+	generationRepo repository.GenerationRepository
+	userRepo       repository.UserRepository
+	modelRepo      repository.ModelRepository
+	tokenService   TokenService
+	httpClient     *http.Client
+	resourcePoolURL string
+	cascadeController scheduler.CascadeController
+}
+
+// NewGenerationService 创建生成服务
+func NewGenerationService(
+	generationRepo repository.GenerationRepository,
+	userRepo repository.UserRepository,
+	modelRepo repository.ModelRepository,
+	tokenService TokenService,
+	cascadeController scheduler.CascadeController,
+	cfg *config.Config,
+) GenerationService {
+	resourcePoolURL := "http://localhost:8001" // 榛樿璧勬簮姹犲湴鍧€
+	timeout := 10 * time.Minute                // 榛樿瓒呮椂鏃堕棿
+
+	if cfg != nil && cfg.ResourcePool.URL != "" {
+		resourcePoolURL = cfg.ResourcePool.URL
+	}
+	if cfg != nil && cfg.ResourcePool.Timeout > 0 {
+		timeout = time.Duration(cfg.ResourcePool.Timeout) * time.Second
+	}
+
+	return &generationService{
+		generationRepo:  generationRepo,
+		userRepo:        userRepo,
+		modelRepo:       modelRepo,
+		tokenService:    tokenService,
+		resourcePoolURL: resourcePoolURL,
+		cascadeController: cascadeController,
+		httpClient: &http.Client{
+			Timeout: timeout,
+		},
+	}
+}
+
+// ResourcePoolRequest 璧勬簮姹犺姹?
+type ResourcePoolRequest struct {
+	Provider        string                 `json:"provider"`
+	UserID          uuid.UUID              `json:"user_id"`
+	ModelName       string                 `json:"model_name"`
+	DefaultParams   map[string]interface{} `json:"default_params,omitempty"`
+	UserInputs      map[string]interface{} `json:"user_inputs"`
+	AdminFixed      map[string]interface{} `json:"admin_fixed,omitempty"`
+	AdapterSettings map[string]interface{} `json:"adapter_settings,omitempty"`
+}
+
+// ResourcePoolResponse 璧勬簮姹犲搷搴?
+type ResourcePoolResponse struct {
+	Data struct {
+		Status     string                 `json:"status"`
+		Progress   float64                `json:"progress"`
+		Message    string                 `json:"message,omitempty"`
+		ResultURL  string                 `json:"result_url,omitempty"`
+		ResultData map[string]interface{} `json:"result_data,omitempty"`
+		Error      string                 `json:"error,omitempty"`
+	} `json:"data"`
+}
+
+// GenerateImage 生成图片
+func (s *generationService) GenerateImage(ctx context.Context, req *model.ImageGenerationRequest, token *model.Token) (*model.ImageGenerationResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if req == nil {
+		return nil, fmt.Errorf("请求不能为空")
+	}
+	if token == nil {
+		return nil, fmt.Errorf("token 不能为空")
+	}
+
+	startTime := time.Now()
+
+	// 鑾峰彇妯″瀷瀹氫环
+	modelPricing, err := s.modelRepo.GetPricing(req.Model)
+	if err != nil {
+		// 濡傛灉娌℃湁瀹氫环淇℃伅锛屼娇鐢ㄩ粯璁ゅ畾浠?
+		modelPricing = &model.ModelPricing{
+			ModelID:     req.Model,
+			InputPrice:  decimal.NewFromFloat(0.01),
+			OutputPrice: decimal.NewFromFloat(0.01),
+			PriceUnit:   1,
+		}
+	}
+
+	// 鍒涘缓浠诲姟璁板綍
+	taskID := uuid.New()
+	task := &model.GenerationTask{
+		ID:       taskID,
+		UserID:   token.UserID,
+		TokenID:  token.ID,
+		Type:     model.GenerationTypeImage,
+		Model:    req.Model,
+		Provider: "unknown",
+		Prompt:   req.Prompt,
+		Params: model.JSON{
+			"size":            req.Size,
+			"aspect_ratio":    req.AspectRatio,
+			"resolution":      req.Resolution,
+			"response_format": req.ResponseFormat,
+			"n":               req.N,
+			"seed":            req.Seed,
+			"watermark":       req.Watermark,
+		},
+		Status:   model.GenerationStatusProcessing,
+		Progress: 0,
+	}
+
+	if err := s.generationRepo.Create(task); err != nil {
+		return nil, fmt.Errorf("鍒涘缓浠诲姟澶辫触: %w", err)
+	}
+
+	// RouteKey=(operation, model_id) 调度：由调度器选择可用源头，再调用资源池执行。
+	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
+		if provider == nil || provider.Channel == nil || provider.Channel.Name == "" {
+			return nil, fmt.Errorf("源头缺少 channel 信息")
+		}
+		if execCtx == nil {
+			execCtx = context.Background()
+		}
+		providerName := provider.Channel.Name
+		upstreamModelName := provider.UpstreamModelName
+		if upstreamModelName == "" {
+			upstreamModelName = req.Model
+		}
+
+		userInputs := map[string]interface{}{
+			"prompt":       req.Prompt,
+			"aspect_ratio": req.AspectRatio,
+			"resolution":   req.Resolution,
+			"seed":         req.Seed,
+			"watermark":    req.Watermark,
+		}
+		if len(req.URLs) > 0 {
+			userInputs["urls"] = req.URLs
+		}
+		if req.Image != "" {
+			userInputs["image"] = req.Image
+		}
+		if req.Size != "" {
+			userInputs["image_size"] = req.Size
+		}
+
+		resourceReq := &ResourcePoolRequest{
+			Provider:      providerName,
+			UserID:        token.UserID,
+			ModelName:     upstreamModelName,
+			DefaultParams: map[string]interface{}{},
+			UserInputs:    userInputs,
+			AdminFixed:    map[string]interface{}{},
+		}
+		return s.callResourcePool(execCtx, resourceReq)
+	}
+
+	if s.cascadeController == nil {
+		errMsg := "调度器未初始化"
+		now := time.Now()
+		task.Status = model.GenerationStatusFailed
+		task.ErrorMessage = &errMsg
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+		return nil, errors.New(errMsg)
+	}
+
+	cascadeResult, err := s.cascadeController.ExecuteWithStrategy(ctx, model.OperationImagesGenerations, req.Model, scheduler.StrategyCostFirst, executor)
+	if err != nil {
+		errMsg := err.Error()
+		now := time.Now()
+		task.Status = model.GenerationStatusFailed
+		task.ErrorMessage = &errMsg
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+		return nil, err
+	}
+
+	if cascadeResult == nil || cascadeResult.Provider == nil || cascadeResult.Provider.Channel == nil || cascadeResult.Provider.Channel.Name == "" {
+		errMsg := "调度结果缺少源头信息"
+		now := time.Now()
+		task.Status = model.GenerationStatusFailed
+		task.ErrorMessage = &errMsg
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+		return nil, errors.New(errMsg)
+	}
+
+	task.Provider = cascadeResult.Provider.Channel.Name
+	result, ok := cascadeResult.Response.(*ResourcePoolResponse)
+	if !ok || result == nil {
+		errMsg := "资源池响应解析失败"
+		now := time.Now()
+		task.Status = model.GenerationStatusFailed
+		task.ErrorMessage = &errMsg
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+		return nil, errors.New(errMsg)
+	}
+
+	// 处理结果
+	if result.Data.Status == "completed" {
+		cost := s.calculateImageCost(modelPricing, req)
+		resultURL := result.Data.ResultURL
+		now := time.Now()
+
+		task.Status = model.GenerationStatusCompleted
+		task.Progress = 1.0
+		task.ResultURL = &resultURL
+		task.Cost = cost
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+
+		if token.User != nil {
+			_ = s.userRepo.DeductBalance(token.UserID, cost)
+		}
+		if token.RemainQuota != nil {
+			_ = s.tokenService.DeductQuota(token.ID, cost)
+		}
+
+		return &model.ImageGenerationResponse{
+			Created: time.Now().Unix(),
+			Data: []model.ImageData{
+				{URL: resultURL},
+			},
+			TaskID: taskID.String(),
+		}, nil
+	}
+
+	errMsg := result.Data.Error
+	if errMsg == "" {
+		errMsg = "图片生成失败"
+	}
+	now := time.Now()
+	task.Status = model.GenerationStatusFailed
+	task.Progress = result.Data.Progress
+	task.ErrorMessage = &errMsg
+	task.Duration = int(time.Since(startTime).Milliseconds())
+	task.CompletedAt = &now
+	_ = s.generationRepo.Update(task)
+	return nil, fmt.Errorf(errMsg)
+}
+
+// GenerateVideo 生成视频
+func (s *generationService) GenerateVideo(ctx context.Context, req *model.VideoGenerationRequest, token *model.Token) (*model.VideoGenerationResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if req == nil {
+		return nil, fmt.Errorf("请求不能为空")
+	}
+	if token == nil {
+		return nil, fmt.Errorf("token 不能为空")
+	}
+
+	startTime := time.Now()
+
+	// 鑾峰彇妯″瀷瀹氫环
+	modelPricing, err := s.modelRepo.GetPricing(req.Model)
+	if err != nil {
+		// 濡傛灉娌℃湁瀹氫环淇℃伅锛屼娇鐢ㄩ粯璁ゅ畾浠?
+		modelPricing = &model.ModelPricing{
+			ModelID:     req.Model,
+			InputPrice:  decimal.NewFromFloat(0.1),
+			OutputPrice: decimal.NewFromFloat(0.1),
+			PriceUnit:   1,
+		}
+	}
+
+	// 鍒涘缓浠诲姟璁板綍
+	taskID := uuid.New()
+	task := &model.GenerationTask{
+		ID:       taskID,
+		UserID:   token.UserID,
+		TokenID:  token.ID,
+		Type:     model.GenerationTypeVideo,
+		Model:    req.Model,
+		Provider: "unknown",
+		Prompt:   req.Prompt,
+		Params: model.JSON{
+			"aspect_ratio": req.AspectRatio,
+			"duration":     req.Duration,
+			"size":         req.Size,
+			"image_url":    req.ImageURL,
+		},
+		Status:   model.GenerationStatusProcessing,
+		Progress: 0,
+	}
+
+	if err := s.generationRepo.Create(task); err != nil {
+		return nil, fmt.Errorf("鍒涘缓浠诲姟澶辫触: %w", err)
+	}
+
+	// RouteKey=(operation, model_id) 调度：由调度器选择可用源头，再调用资源池执行。
+	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
+		if provider == nil || provider.Channel == nil || provider.Channel.Name == "" {
+			return nil, fmt.Errorf("源头缺少 channel 信息")
+		}
+		if execCtx == nil {
+			execCtx = context.Background()
+		}
+		providerName := provider.Channel.Name
+		upstreamModelName := provider.UpstreamModelName
+		if upstreamModelName == "" {
+			upstreamModelName = req.Model
+		}
+
+		userInputs := map[string]interface{}{
+			"prompt":       req.Prompt,
+			"aspect_ratio": req.AspectRatio,
+			"duration":     req.Duration,
+			"size":         req.Size,
+		}
+		if req.ImageURL != "" {
+			userInputs["image"] = req.ImageURL
+		}
+
+		resourceReq := &ResourcePoolRequest{
+			Provider:      providerName,
+			UserID:        token.UserID,
+			ModelName:     upstreamModelName,
+			DefaultParams: map[string]interface{}{},
+			UserInputs:    userInputs,
+			AdminFixed:    map[string]interface{}{},
+		}
+		return s.callResourcePool(execCtx, resourceReq)
+	}
+
+	if s.cascadeController == nil {
+		errMsg := "调度器未初始化"
+		now := time.Now()
+		task.Status = model.GenerationStatusFailed
+		task.ErrorMessage = &errMsg
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+		return nil, errors.New(errMsg)
+	}
+
+	cascadeResult, err := s.cascadeController.ExecuteWithStrategy(ctx, model.OperationVideosGenerations, req.Model, scheduler.StrategyCostFirst, executor)
+	if err != nil {
+		errMsg := err.Error()
+		now := time.Now()
+		task.Status = model.GenerationStatusFailed
+		task.ErrorMessage = &errMsg
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+		return nil, err
+	}
+
+	if cascadeResult == nil || cascadeResult.Provider == nil || cascadeResult.Provider.Channel == nil || cascadeResult.Provider.Channel.Name == "" {
+		errMsg := "调度结果缺少源头信息"
+		now := time.Now()
+		task.Status = model.GenerationStatusFailed
+		task.ErrorMessage = &errMsg
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+		return nil, errors.New(errMsg)
+	}
+
+	task.Provider = cascadeResult.Provider.Channel.Name
+	result, ok := cascadeResult.Response.(*ResourcePoolResponse)
+	if !ok || result == nil {
+		errMsg := "资源池响应解析失败"
+		now := time.Now()
+		task.Status = model.GenerationStatusFailed
+		task.ErrorMessage = &errMsg
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+		return nil, errors.New(errMsg)
+	}
+
+	// 处理结果
+	if result.Data.Status == "completed" {
+		cost := s.calculateVideoCost(modelPricing, req)
+		resultURL := result.Data.ResultURL
+		now := time.Now()
+
+		task.Status = model.GenerationStatusCompleted
+		task.Progress = 1.0
+		task.ResultURL = &resultURL
+		task.Cost = cost
+		task.Duration = int(time.Since(startTime).Milliseconds())
+		task.CompletedAt = &now
+		_ = s.generationRepo.Update(task)
+
+		if token.User != nil {
+			_ = s.userRepo.DeductBalance(token.UserID, cost)
+		}
+		if token.RemainQuota != nil {
+			_ = s.tokenService.DeductQuota(token.ID, cost)
+		}
+
+		return &model.VideoGenerationResponse{
+			ID:        taskID.String(),
+			Status:    model.GenerationStatusCompleted,
+			Progress:  1.0,
+			CreatedAt: time.Now().Unix(),
+			Data: &model.VideoData{
+				URL:      resultURL,
+				Duration: req.Duration,
+			},
+		}, nil
+	}
+
+	errMsg := result.Data.Error
+	if errMsg == "" {
+		errMsg = "视频生成失败"
+	}
+	now := time.Now()
+	task.Status = model.GenerationStatusFailed
+	task.Progress = result.Data.Progress
+	task.ErrorMessage = &errMsg
+	task.Duration = int(time.Since(startTime).Milliseconds())
+	task.CompletedAt = &now
+	_ = s.generationRepo.Update(task)
+	return nil, fmt.Errorf(errMsg)
+}
+
+// GetTaskStatus 鑾峰彇浠诲姟鐘舵€?
+func (s *generationService) GetTaskStatus(taskID uuid.UUID, userID uuid.UUID) (*model.GenerationTaskResponse, error) {
+	task, err := s.generationRepo.GetByID(taskID)
+	if err != nil {
+		return nil, fmt.Errorf("浠诲姟涓嶅瓨鍦? %w", err)
+	}
+
+	// 楠岃瘉鐢ㄦ埛鏉冮檺
+	if task.UserID != userID {
+		return nil, fmt.Errorf("鏃犳潈璁块棶姝や换鍔?)
+	}
+
+	return task.ToResponse(), nil
+}
+
+// ListUserTasks 鑾峰彇鐢ㄦ埛浠诲姟鍒楄〃
+func (s *generationService) ListUserTasks(userID uuid.UUID, taskType model.GenerationType, page, pageSize int) ([]model.GenerationTaskResponse, int64, error) {
+	tasks, total, err := s.generationRepo.GetByUserID(userID, taskType, page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var responses []model.GenerationTaskResponse
+	for _, task := range tasks {
+		responses = append(responses, *task.ToResponse())
+	}
+
+	return responses, total, nil
+}
+
+// callResourcePool 璋冪敤璧勬簮姹犳湇鍔?
+func (s *generationService) callResourcePool(req *ResourcePoolRequest) (*ResourcePoolResponse, error) {
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("搴忓垪鍖栬姹傚け璐? %w", err)
+	}
+
+	httpReq, err := http.NewRequest("POST", s.resourcePoolURL+"/v1/generate", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("鍒涘缓璇锋眰澶辫触: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("璇锋眰璧勬簮姹犲け璐? %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("璧勬簮姹犺繑鍥為敊璇? %d - %s", resp.StatusCode, string(body))
+	}
+
+	var result ResourcePoolResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("瑙ｆ瀽鍝嶅簲澶辫触: %w", err)
+	}
+
+	return &result, nil
+}
+
+// calculateImageCost 璁＄畻鍥剧墖鐢熸垚璐圭敤
+func (s *generationService) calculateImageCost(pricing *model.ModelPricing, req *model.ImageGenerationRequest) decimal.Decimal {
+	if pricing == nil {
+		return decimal.Zero
+	}
+
+	// 鍩虹璐圭敤
+	baseCost := pricing.InputPrice
+
+	// 鏍规嵁鍒嗚鲸鐜囪皟鏁磋垂鐢?
+	resolutionMultiplier := decimal.NewFromFloat(1.0)
+	switch req.Resolution {
+	case "2K":
+		resolutionMultiplier = decimal.NewFromFloat(1.5)
+	case "4K":
+		resolutionMultiplier = decimal.NewFromFloat(2.0)
+	}
+
+	// 璁＄畻鎬昏垂鐢?
+	n := req.N
+	if n <= 0 {
+		n = 1
+	}
+
+	return baseCost.Mul(resolutionMultiplier).Mul(decimal.NewFromInt(int64(n)))
+}
+
+// calculateVideoCost 璁＄畻瑙嗛鐢熸垚璐圭敤
+func (s *generationService) calculateVideoCost(pricing *model.ModelPricing, req *model.VideoGenerationRequest) decimal.Decimal {
+	if pricing == nil {
+		return decimal.Zero
+	}
+
+	// 鍩虹璐圭敤
+	baseCost := pricing.InputPrice
+
+	// 鏍规嵁鏃堕暱璋冩暣璐圭敤
+	duration := req.Duration
+	if duration <= 0 {
+		duration = 10
+	}
+	durationMultiplier := decimal.NewFromFloat(float64(duration) / 10.0)
+
+	// 鏍规嵁灏哄璋冩暣璐圭敤
+	sizeMultiplier := decimal.NewFromFloat(1.0)
+	if req.Size == "large" {
+		sizeMultiplier = decimal.NewFromFloat(1.5)
+	}
+
+	return baseCost.Mul(durationMultiplier).Mul(sizeMultiplier)
+}

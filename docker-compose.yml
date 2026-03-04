@@ -1,0 +1,313 @@
+﻿version: '3.8'
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres123}
+      POSTGRES_DB: ${DB_NAME:-nexus_api}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # Redis 缓存
+  redis:
+    image: redis:7-alpine
+    container_name: nexus-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  # 后端 API 服务
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nexus-api
+    restart: unless-stopped
+    environment:
+      - SERVER_PORT=8080
+      - SERVER_MODE=${SERVER_MODE:-release}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres123}
+      - DB_NAME=${DB_NAME:-nexus_api}
+      - DB_SSL_MODE=disable
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_DB=0
+      - JWT_SECRET=${JWT_SECRET:-your_jwt_secret_key_change_in_production}
+      - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}
+      - JWT_ISSUER=nexus-api
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-}
+      # 兼容旧变量名
+      - DEFAULT_ADMIN_USERNAME=${DEFAULT_ADMIN_USERNAME:-}
+      - DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-}
+      - DEFAULT_ADMIN_EMAIL=${DEFAULT_ADMIN_EMAIL:-}
+      - RESOURCE_POOL_URL=${RESOURCE_POOL_URL:-http://resource-pool:8000}
+      - RESOURCE_POOL_TIMEOUT=${RESOURCE_POOL_TIMEOUT:-600}
+      - STORAGE_DRIVER=${STORAGE_DRIVER:-local}
+      - STORAGE_LOCAL_DIR=${STORAGE_LOCAL_DIR:-/app/data/objects}
+      - STORAGE_SIGN_SECRET=${STORAGE_SIGN_SECRET:-}
+      - OSS_ENDPOINT=${OSS_ENDPOINT:-oss-cn-shenzhen.aliyuncs.com}
+      - OSS_BUCKET=${OSS_BUCKET:-wool-good}
+      - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID:-}
+      - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET:-}
+      - OSS_PUBLIC_BASE_URL=${OSS_PUBLIC_BASE_URL:-}
+      - OSS_SIGN_EXPIRE_SECONDS=${OSS_SIGN_EXPIRE_SECONDS:-900}
+    volumes:
+      - api_data:/app/data
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - nexus-network
+
+  # 异步作业 Worker（处理 generation_tasks）
+  job-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nexus-job-worker
+    restart: unless-stopped
+    environment:
+      - SERVER_MODE=${SERVER_MODE:-release}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres123}
+      - DB_NAME=${DB_NAME:-nexus_api}
+      - DB_SSL_MODE=disable
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_DB=0
+      - JWT_SECRET=${JWT_SECRET:-your_jwt_secret_key_change_in_production}
+      - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}
+      - JWT_ISSUER=nexus-api
+      - RESOURCE_POOL_URL=${RESOURCE_POOL_URL:-http://resource-pool:8000}
+      - RESOURCE_POOL_TIMEOUT=${RESOURCE_POOL_TIMEOUT:-600}
+      - STORAGE_DRIVER=${STORAGE_DRIVER:-local}
+      - STORAGE_LOCAL_DIR=${STORAGE_LOCAL_DIR:-/app/data/objects}
+      - STORAGE_SIGN_SECRET=${STORAGE_SIGN_SECRET:-}
+      - OSS_ENDPOINT=${OSS_ENDPOINT:-oss-cn-shenzhen.aliyuncs.com}
+      - OSS_BUCKET=${OSS_BUCKET:-wool-good}
+      - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID:-}
+      - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET:-}
+      - OSS_PUBLIC_BASE_URL=${OSS_PUBLIC_BASE_URL:-}
+      - OSS_SIGN_EXPIRE_SECONDS=${OSS_SIGN_EXPIRE_SECONDS:-900}
+      - JOB_WORKER_POLL_SECONDS=${JOB_WORKER_POLL_SECONDS:-2}
+      - JOB_WORKER_BATCH_SIZE=${JOB_WORKER_BATCH_SIZE:-5}
+      - JOB_WORKER_CONCURRENCY=${JOB_WORKER_CONCURRENCY:-2}
+      - JOB_WORKER_STALE_SECONDS=${JOB_WORKER_STALE_SECONDS:-900}
+    volumes:
+      - api_data:/app/data
+    command: ["./job-worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      resource-pool:
+        condition: service_started
+    networks:
+      - nexus-network
+
+  # 指标聚合 Worker（把 logs 低频聚合写入 provider_metrics）
+  metrics-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nexus-metrics-worker
+    restart: unless-stopped
+    environment:
+      - SERVER_MODE=${SERVER_MODE:-release}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres123}
+      - DB_NAME=${DB_NAME:-nexus_api}
+      - DB_SSL_MODE=disable
+      - METRICS_WORKER_POLL_SECONDS=${METRICS_WORKER_POLL_SECONDS:-60}
+      - METRICS_WORKER_LOOKBACK_SECONDS=${METRICS_WORKER_LOOKBACK_SECONDS:-600}
+    command: ["./metrics-worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - nexus-network
+
+  # Prometheus 监控
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: nexus-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - api
+    networks:
+      - nexus-network
+
+  # Grafana 看板
+  grafana:
+    image: grafana/grafana:latest
+    container_name: nexus-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3002}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - nexus-network
+
+  # 资源池（Python 引擎服务：逆向/不稳定上游适配器）
+  resource-pool:
+    build:
+      context: ./resource-pool
+      dockerfile: Dockerfile
+    container_name: nexus-resource-pool
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=${RESOURCE_POOL_LOG_LEVEL:-INFO}
+      - JWT_SECRET=${JWT_SECRET:-your_jwt_secret_key_change_in_production}
+      - STORAGE_DRIVER=${STORAGE_DRIVER:-local}
+      - STORAGE_LOCAL_DIR=${STORAGE_LOCAL_DIR:-/app/data/objects}
+      - STORAGE_SIGN_SECRET=${STORAGE_SIGN_SECRET:-}
+      - JIMENG_POOL_DB_PATH=${JIMENG_POOL_DB_PATH:-/app/data/jimeng_pool.db}
+      - JIMENG_CREDIT_CACHE_SECONDS=${JIMENG_CREDIT_CACHE_SECONDS:-60}
+      - JIMENG_ACCOUNT_COOLDOWN_SECONDS=${JIMENG_ACCOUNT_COOLDOWN_SECONDS:-60}
+      - JIMENG_BASE_CONFIG_JSON=${JIMENG_BASE_CONFIG_JSON:-}
+      - OSS_ENDPOINT=${OSS_ENDPOINT:-oss-cn-shenzhen.aliyuncs.com}
+      - OSS_BUCKET=${OSS_BUCKET:-wool-good}
+      - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID:-}
+      - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET:-}
+      - OSS_PUBLIC_BASE_URL=${OSS_PUBLIC_BASE_URL:-}
+      - OSS_SIGN_EXPIRE_SECONDS=${OSS_SIGN_EXPIRE_SECONDS:-900}
+      - SORA2_API_HOST=${SORA2_API_HOST:-}
+      - SORA2_API_KEY=${SORA2_API_KEY:-}
+      - BANANA_API_HOST=${BANANA_API_HOST:-}
+      - BANANA_API_KEY=${BANANA_API_KEY:-}
+      - SEEDREAM_BASE_URL=${SEEDREAM_BASE_URL:-}
+      - SEEDREAM_API_KEY=${SEEDREAM_API_KEY:-}
+    volumes:
+      - api_data:/app/data
+    ports:
+      - "${RESOURCE_POOL_PORT:-8090}:8000"
+    networks:
+      - nexus-network
+
+  # 用户端前端
+  frontend-user:
+    build:
+      context: ./frontend-user
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    container_name: nexus-frontend-user
+    restart: unless-stopped
+    profiles:
+      - production
+    ports:
+      - "${FRONTEND_USER_PORT:-3000}:3000"
+    depends_on:
+      - api
+    networks:
+      - nexus-network
+
+  # 管理员端前端
+  frontend-admin:
+    build:
+      context: ./frontend-admin
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    container_name: nexus-frontend-admin
+    restart: unless-stopped
+    profiles:
+      - production
+    ports:
+      - "${FRONTEND_ADMIN_PORT:-3001}:3000"
+    depends_on:
+      - api
+    networks:
+      - nexus-network
+
+  # Nginx 反向代理（可选）
+  nginx:
+    image: nginx:alpine
+    container_name: nexus-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+      - frontend-user
+      - frontend-admin
+    networks:
+      - nexus-network
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  api_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  nexus-network:
+    driver: bridge
+

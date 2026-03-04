@@ -1,0 +1,11 @@
+{
+  "host": "https://api.kuai.host",
+  "model": "gemini-3-pro-image-preview",
+  "api_key": "<YOUR_API_KEY>",
+  "use_query_key": false,
+  "nano_host": "https://ai.t8star.cn",
+  "nano_endpoint": "/v1/images/edits",
+  "nano_model": "nano-banana",
+  "nano_api_key": "<YOUR_API_KEY>",
+  "nano_response_format": "url"
+}

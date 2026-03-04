@@ -1,0 +1,333 @@
+// Legacy file: 已迁移到新的 GenerationHandler 实现（避免编译此文件）
+package handler
+
+import (
+	"net/http"
+
+	"nexus-api/internal/middleware"
+	"nexus-api/internal/model"
+	"nexus-api/internal/service"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// GenerationHandler 鐢熸垚澶勭悊鍣?
+type GenerationHandler struct {
+	generationService service.GenerationService
+}
+
+// NewGenerationHandler 鍒涘缓鐢熸垚澶勭悊鍣?
+func NewGenerationHandler(generationService service.GenerationService) *GenerationHandler {
+	return &GenerationHandler{
+		generationService: generationService,
+	}
+}
+
+// ImageGenerations 鍥剧墖鐢熸垚
+// @Summary 鍥剧墖鐢熸垚
+// @Description 鍒涘缓鍥剧墖鐢熸垚璇锋眰锛屽吋瀹?OpenAI API
+// @Tags Generation
+// @Accept json
+// @Produce json
+// @Param Authorization header string true "Bearer Token"
+// @Param request body model.ImageGenerationRequest true "璇锋眰鍙傛暟"
+// @Success 200 {object} model.ImageGenerationResponse
+// @Failure 400 {object} model.OpenAIError
+// @Failure 401 {object} model.OpenAIError
+// @Failure 500 {object} model.OpenAIError
+// @Router /v1/images/generations [post]
+func (h *GenerationHandler) ImageGenerations(c *gin.Context) {
+	// 鑾峰彇 Token 淇℃伅
+	token, ok := middleware.GetCurrentToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, model.NewOpenAIError(
+			"鏈巿鏉冪殑璇锋眰",
+			model.OpenAIErrorTypeAuthentication,
+			nil,
+		))
+		return
+	}
+
+	// 瑙ｆ瀽璇锋眰
+	var req model.ImageGenerationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"鏃犳晥鐨勮姹傚弬鏁? "+err.Error(),
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 楠岃瘉妯″瀷
+	if req.Model == "" {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"缂哄皯蹇呴渶鍙傛暟: model",
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 楠岃瘉 prompt
+	if req.Prompt == "" {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"缂哄皯蹇呴渶鍙傛暟: prompt",
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 楠岃瘉妯″瀷鏄惁鏀寔
+	if !model.IsImageModel(req.Model) {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"涓嶆敮鎸佺殑鍥剧墖鐢熸垚妯″瀷: "+req.Model,
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 璁剧疆榛樿鍊?
+	if req.N <= 0 {
+		req.N = 1
+	}
+	if req.AspectRatio == "" {
+		req.AspectRatio = "1:1"
+	}
+	if req.Resolution == "" {
+		req.Resolution = "1K"
+	}
+	if req.ResponseFormat == "" {
+		req.ResponseFormat = "url"
+	}
+
+	// 澶勭悊璇锋眰
+	resp, err := h.generationService.GenerateImage(&req, token)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, model.NewOpenAIError(
+			err.Error(),
+			model.OpenAIErrorTypeServer,
+			nil,
+		))
+		return
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// VideoGenerations 瑙嗛鐢熸垚
+// @Summary 瑙嗛鐢熸垚
+// @Description 鍒涘缓瑙嗛鐢熸垚璇锋眰
+// @Tags Generation
+// @Accept json
+// @Produce json
+// @Param Authorization header string true "Bearer Token"
+// @Param request body model.VideoGenerationRequest true "璇锋眰鍙傛暟"
+// @Success 200 {object} model.VideoGenerationResponse
+// @Failure 400 {object} model.OpenAIError
+// @Failure 401 {object} model.OpenAIError
+// @Failure 500 {object} model.OpenAIError
+// @Router /v1/videos/generations [post]
+func (h *GenerationHandler) VideoGenerations(c *gin.Context) {
+	// 鑾峰彇 Token 淇℃伅
+	token, ok := middleware.GetCurrentToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, model.NewOpenAIError(
+			"鏈巿鏉冪殑璇锋眰",
+			model.OpenAIErrorTypeAuthentication,
+			nil,
+		))
+		return
+	}
+
+	// 瑙ｆ瀽璇锋眰
+	var req model.VideoGenerationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"鏃犳晥鐨勮姹傚弬鏁? "+err.Error(),
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 楠岃瘉妯″瀷
+	if req.Model == "" {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"缂哄皯蹇呴渶鍙傛暟: model",
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 楠岃瘉 prompt
+	if req.Prompt == "" {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"缂哄皯蹇呴渶鍙傛暟: prompt",
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 楠岃瘉妯″瀷鏄惁鏀寔
+	if !model.IsVideoModel(req.Model) {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"涓嶆敮鎸佺殑瑙嗛鐢熸垚妯″瀷: "+req.Model,
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 璁剧疆榛樿鍊?
+	if req.AspectRatio == "" {
+		req.AspectRatio = "9:16"
+	}
+	if req.Duration <= 0 {
+		req.Duration = 10
+	}
+	if req.Size == "" {
+		req.Size = "small"
+	}
+
+	// 澶勭悊璇锋眰
+	resp, err := h.generationService.GenerateVideo(&req, token)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, model.NewOpenAIError(
+			err.Error(),
+			model.OpenAIErrorTypeServer,
+			nil,
+		))
+		return
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// GetTaskStatus 鑾峰彇浠诲姟鐘舵€?
+// @Summary 鑾峰彇浠诲姟鐘舵€?
+// @Description 鑾峰彇鐢熸垚浠诲姟鐨勭姸鎬?
+// @Tags Generation
+// @Accept json
+// @Produce json
+// @Param Authorization header string true "Bearer Token"
+// @Param id path string true "浠诲姟 ID"
+// @Success 200 {object} model.GenerationTaskResponse
+// @Failure 400 {object} model.OpenAIError
+// @Failure 401 {object} model.OpenAIError
+// @Failure 404 {object} model.OpenAIError
+// @Router /v1/generations/{id} [get]
+func (h *GenerationHandler) GetTaskStatus(c *gin.Context) {
+	// 鑾峰彇 Token 淇℃伅
+	token, ok := middleware.GetCurrentToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, model.NewOpenAIError(
+			"鏈巿鏉冪殑璇锋眰",
+			model.OpenAIErrorTypeAuthentication,
+			nil,
+		))
+		return
+	}
+
+	// 鑾峰彇浠诲姟 ID
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, model.NewOpenAIError(
+			"鏃犳晥鐨勪换鍔?ID",
+			model.OpenAIErrorTypeInvalidRequest,
+			nil,
+		))
+		return
+	}
+
+	// 鑾峰彇浠诲姟鐘舵€?
+	resp, err := h.generationService.GetTaskStatus(taskID, token.UserID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, model.NewOpenAIError(
+			err.Error(),
+			model.OpenAIErrorTypeNotFound,
+			nil,
+		))
+		return
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// ListUserTasks 鑾峰彇鐢ㄦ埛浠诲姟鍒楄〃
+// @Summary 鑾峰彇鐢ㄦ埛浠诲姟鍒楄〃
+// @Description 鑾峰彇褰撳墠鐢ㄦ埛鐨勭敓鎴愪换鍔″垪琛?
+// @Tags Generation
+// @Accept json
+// @Produce json
+// @Param Authorization header string true "Bearer Token"
+// @Param type query string false "浠诲姟绫诲瀷 (image/video)"
+// @Param page query int false "椤电爜" default(1)
+// @Param page_size query int false "姣忛〉鏁伴噺" default(20)
+// @Success 200 {object} map[string]interface{}
+// @Failure 401 {object} model.OpenAIError
+// @Router /v1/generations [get]
+func (h *GenerationHandler) ListUserTasks(c *gin.Context) {
+	// 鑾峰彇 Token 淇℃伅
+	token, ok := middleware.GetCurrentToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, model.NewOpenAIError(
+			"鏈巿鏉冪殑璇锋眰",
+			model.OpenAIErrorTypeAuthentication,
+			nil,
+		))
+		return
+	}
+
+	// 鑾峰彇鏌ヨ鍙傛暟
+	taskType := model.GenerationType(c.Query("type"))
+	page := 1
+	pageSize := 20
+
+	if p := c.Query("page"); p != "" {
+		if parsed, err := parseInt(p); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	if ps := c.Query("page_size"); ps != "" {
+		if parsed, err := parseInt(ps); err == nil && parsed > 0 && parsed <= 100 {
+			pageSize = parsed
+		}
+	}
+
+	// 鑾峰彇浠诲姟鍒楄〃
+	tasks, total, err := h.generationService.ListUserTasks(token.UserID, taskType, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, model.NewOpenAIError(
+			err.Error(),
+			model.OpenAIErrorTypeServer,
+			nil,
+		))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":      tasks,
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+	})
+}
+
+// parseInt 瑙ｆ瀽鏁存暟
+func parseInt(s string) (int, error) {
+	var result int
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, nil
+		}
+		result = result*10 + int(c-'0')
+	}
+	return result, nil
+}
