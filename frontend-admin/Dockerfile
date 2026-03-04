@@ -1,21 +1,25 @@
 # Build stage
 FROM node:18-alpine AS builder
 
-WORKDIR /app
+WORKDIR /workspace
 
 ARG NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 
 # Copy package files
-COPY package*.json ./
+COPY frontend-admin/package*.json ./frontend-admin/
 
 # Install dependencies
+WORKDIR /workspace/frontend-admin
 RUN npm install --no-audit --no-fund
 
-# Copy source code
-COPY . .
+# Copy source code and shared-utils
+WORKDIR /workspace
+COPY packages/shared-utils ./packages/shared-utils
+COPY frontend-admin ./frontend-admin
 
 # Build the application
+WORKDIR /workspace/frontend-admin
 RUN mkdir -p public && npm run build
 
 # Production stage
@@ -32,9 +36,9 @@ RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
 
 # Copy built application
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /workspace/frontend-admin/public ./public
+COPY --from=builder /workspace/frontend-admin/.next/standalone ./
+COPY --from=builder /workspace/frontend-admin/.next/static ./.next/static
 
 # Set correct permissions
 USER nextjs

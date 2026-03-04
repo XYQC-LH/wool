@@ -91,12 +91,14 @@ func AutoMigrate() error {
 		&model.ModelProvider{},
 		&model.ProviderMetrics{},
 		&model.CircuitEventRecord{},
+		&model.ModelRoute{}, // 路由表（RouteKey = operation + model_id）
 
 		// ⭐ 源头实例（号池调度支持）
 		&model.ProviderInstance{},
 
 		// ⭐ 多模态配置表（能力/计费/限流/幂等）
 		&model.ModelCapability{},
+		&model.ProviderCapability{}, // 源头能力约束表
 		&model.ProviderPricingRule{},
 		&model.ProviderRateLimitRule{},
 		&model.IdempotencyKey{},

@@ -253,7 +253,7 @@ function MyComponent() {
 
 ```bash
 # 构建镜像
-docker build -t nexus-admin .
+docker build -f frontend-admin/Dockerfile -t nexus-admin .
 
 # 运行容器
 docker run -p 3001:3000 nexus-admin
