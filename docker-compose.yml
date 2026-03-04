@@ -242,8 +242,8 @@ services:
   # 用户端前端
   frontend-user:
     build:
-      context: ./frontend-user
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: frontend-user/Dockerfile
       args:
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8080}
     container_name: nexus-frontend-user
@@ -260,8 +260,8 @@ services:
   # 管理员端前端
   frontend-admin:
     build:
-      context: ./frontend-admin
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: frontend-admin/Dockerfile
       args:
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8080}
     container_name: nexus-frontend-admin
