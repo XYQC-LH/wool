@@ -65,20 +65,46 @@ func DefaultCascadeConfig() *CascadeConfig {
 	}
 }
 
+type dispatchRequestIDContextKey struct{}
+
+// WithDispatchRequestID 将调度请求ID注入上下文（用于 dispatch_attempts 审计）
+func WithDispatchRequestID(ctx context.Context, requestID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if requestID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, dispatchRequestIDContextKey{}, requestID)
+}
+
+func dispatchRequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value := ctx.Value(dispatchRequestIDContextKey{})
+	requestID, _ := value.(string)
+	return requestID
+}
+
 // cascadeController 绾ц仈鎺у埗鍣ㄥ疄鐜?
 type cascadeController struct {
-	selector          ProviderSelector
-	circuitBreaker    CircuitBreaker
-	instanceScheduler InstanceScheduler
-	instanceRepo      repository.ProviderInstanceRepository
-	commitGuard       CommitGuard     // ⭐ CommitGuard：提交点门控（现阶段复用 StreamGuard 首包锁定）
-	modelAggregator   ModelAggregator // 猸?鏂板锛氭ā鍨嬭仛鍚堝櫒
-	capabilityRepo    repository.ModelCapabilityRepository
-	rateLimiter       ProviderRateLimiter
-	providerRepo      repository.ModelProviderRepository
-	metricsRepo       repository.ProviderMetricsRepository
-	config            *CascadeConfig
-	mu                sync.RWMutex
+	selector              ProviderSelector
+	circuitBreaker        CircuitBreaker
+	instanceScheduler     InstanceScheduler
+	instanceRepo          repository.ProviderInstanceRepository
+	commitGuard           CommitGuard     // ⭐ CommitGuard：提交点门控（现阶段复用 StreamGuard 首包锁定）
+	modelAggregator       ModelAggregator // 猸?鏂板锛氭ā鍨嬭仛鍚堝櫒
+	capabilityRepo        repository.ModelCapabilityRepository
+	capabilityMatcher     CapabilityMatcher
+	routeResolver         RouteResolver
+	sourceAdapterRegistry SourceAdapterRegistry
+	dispatchAttemptRepo repository.DispatchAttemptRepository
+	rateLimiter          ProviderRateLimiter
+	providerRepo         repository.ModelProviderRepository
+	metricsRepo          repository.ProviderMetricsRepository
+	config               *CascadeConfig
+	mu                   sync.RWMutex
 }
 
 // NewCascadeController 鍒涘缓绾ц仈鎺у埗鍣?
@@ -92,24 +118,36 @@ func NewCascadeController(
 	commitGuard CommitGuard, // ⭐ CommitGuard
 	modelAggregator ModelAggregator, // 猸?鏂板鍙傛暟
 	capabilityRepo repository.ModelCapabilityRepository,
+	capabilityMatcher CapabilityMatcher,
+	routeResolver RouteResolver,
+	dispatchAttemptRepo repository.DispatchAttemptRepository,
 	rateLimiter ProviderRateLimiter,
 	config *CascadeConfig,
+	sourceAdapterRegistries ...SourceAdapterRegistry,
 ) CascadeController {
 	if config == nil {
 		config = DefaultCascadeConfig()
 	}
+	var sourceAdapterRegistry SourceAdapterRegistry
+	if len(sourceAdapterRegistries) > 0 {
+		sourceAdapterRegistry = sourceAdapterRegistries[0]
+	}
 	return &cascadeController{
-		selector:          selector,
-		circuitBreaker:    circuitBreaker,
-		instanceScheduler: instanceScheduler,
-		instanceRepo:      instanceRepo,
-		commitGuard:       commitGuard,     // ⭐ CommitGuard
-		modelAggregator:   modelAggregator, // 猸?鏂板
-		capabilityRepo:    capabilityRepo,
-		rateLimiter:       rateLimiter,
-		providerRepo:      providerRepo,
-		metricsRepo:       metricsRepo,
-		config:            config,
+		selector:              selector,
+		circuitBreaker:        circuitBreaker,
+		instanceScheduler:     instanceScheduler,
+		instanceRepo:          instanceRepo,
+		commitGuard:           commitGuard,     // ⭐ CommitGuard
+		modelAggregator:       modelAggregator, // 猸?鏂板
+		capabilityRepo:        capabilityRepo,
+		capabilityMatcher:     capabilityMatcher,
+		routeResolver:         routeResolver,
+		sourceAdapterRegistry: sourceAdapterRegistry,
+		dispatchAttemptRepo: dispatchAttemptRepo,
+		rateLimiter:          rateLimiter,
+		providerRepo:         providerRepo,
+		metricsRepo:          metricsRepo,
+		config:               config,
 	}
 }
 
@@ -124,22 +162,10 @@ func (c *cascadeController) ExecuteWithStrategy(ctx context.Context, operation s
 	operation = model.NormalizeOperation(operation)
 	startTime := time.Now()
 
-	// 猸?姝ラ2: ModelAggregator - 瑙ｆ瀽妯″瀷鍒悕骞惰幏鍙?ProviderGroup 鍒楄〃
-	resolvedModelID, err := c.modelAggregator.ResolveModelAlias(ctx, modelID)
+	resolvedModelID, providers, err := c.buildProvidersForDispatch(ctx, operation, modelID, strategy)
 	if err != nil {
-		return nil, fmt.Errorf("瑙ｆ瀽妯″瀷鍒悕澶辫触: %w", err)
-	}
-
-	// 鑾峰彇鎺掑簭鍚庣殑婧愬ご鍒楄〃
-	if err := c.ensureModelCapability(ctx, resolvedModelID, operation); err != nil {
 		return nil, err
 	}
-
-	providers, err := c.selector.SelectProviders(ctx, operation, resolvedModelID, strategy)
-	if err != nil {
-		return nil, fmt.Errorf("鑾峰彇婧愬ご鍒楄〃澶辫触: %w", err)
-	}
-
 	if len(providers) == 0 {
 		return nil, &NoAvailableProviderError{Operation: operation, ModelID: modelID}
 	}
@@ -169,7 +195,7 @@ func (c *cascadeController) ExecuteWithStrategy(ctx context.Context, operation s
 		result.AttemptCount++
 
 		// 妫€鏌ョ啍鏂櫒鐘舵€?
-		if enableCircuitBreaker {
+		if enableCircuitBreaker && c.circuitBreaker != nil {
 			canExecute, err := c.circuitBreaker.CanExecute(ctx, provider.ID)
 			if err != nil {
 				// 鐔旀柇鍣ㄦ鏌ュけ璐ワ紝璁板綍浣嗙户缁皾璇?
@@ -178,6 +204,22 @@ func (c *cascadeController) ExecuteWithStrategy(ctx context.Context, operation s
 					ProviderID: provider.ID,
 					Error:      lastError.Error(),
 					LatencyMs:  0,
+				})
+				c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+					RequestID:         dispatchRequestIDFromContext(ctx),
+					Operation:         operation,
+					RequestedModelID:  modelID,
+					ResolvedModelID:   resolvedModelID,
+					RouteModelID:      provider.ModelID,
+					ProviderID:        provider.ID,
+					AttemptNo:         attempt + 1,
+					Strategy:          string(strategy),
+					Stage:             "cascade",
+					Decision:          "rejected",
+					Success:           false,
+					ErrorType:         "circuit_check_error",
+					ErrorMessage:      lastError.Error(),
+					LatencyMs:         0,
 				})
 				continue
 			}
@@ -188,6 +230,22 @@ func (c *cascadeController) ExecuteWithStrategy(ctx context.Context, operation s
 					ProviderID: provider.ID,
 					Error:      "鐔旀柇鍣ㄦ墦寮€",
 					LatencyMs:  0,
+				})
+				c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+					RequestID:         dispatchRequestIDFromContext(ctx),
+					Operation:         operation,
+					RequestedModelID:  modelID,
+					ResolvedModelID:   resolvedModelID,
+					RouteModelID:      provider.ModelID,
+					ProviderID:        provider.ID,
+					AttemptNo:         attempt + 1,
+					Strategy:          string(strategy),
+					Stage:             "health_gate",
+					Decision:          "rejected",
+					Success:           false,
+					ErrorType:         "circuit_open",
+					ErrorMessage:      "circuit_open",
+					LatencyMs:         0,
 				})
 				continue
 			}
@@ -202,6 +260,22 @@ func (c *cascadeController) ExecuteWithStrategy(ctx context.Context, operation s
 					ProviderName: c.getProviderName(provider),
 					Error:        "rate_limit",
 					LatencyMs:    0,
+				})
+				c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+					RequestID:         dispatchRequestIDFromContext(ctx),
+					Operation:         operation,
+					RequestedModelID:  modelID,
+					ResolvedModelID:   resolvedModelID,
+					RouteModelID:      provider.ModelID,
+					ProviderID:        provider.ID,
+					AttemptNo:         attempt + 1,
+					Strategy:          string(strategy),
+					Stage:             "health_gate",
+					Decision:          "rejected",
+					Success:           false,
+					ErrorType:         "rate_limit",
+					ErrorMessage:      "rate_limit",
+					LatencyMs:         0,
 				})
 				continue
 			}
@@ -223,12 +297,28 @@ func (c *cascadeController) ExecuteWithStrategy(ctx context.Context, operation s
 			})
 
 			// 璁板綍澶辫触鍒扮啍鏂櫒
-			if enableCircuitBreaker {
+			if enableCircuitBreaker && c.circuitBreaker != nil {
 				_ = c.circuitBreaker.RecordFailure(ctx, provider.ID, err)
 			}
 
 			// 鏇存柊婧愬ご缁熻
 			_ = c.providerRepo.IncrementStats(ctx, provider.ID, false, attemptLatency, 0, 0, decimal.Zero)
+			c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+				RequestID:         dispatchRequestIDFromContext(ctx),
+				Operation:         operation,
+				RequestedModelID:  modelID,
+				ResolvedModelID:   resolvedModelID,
+				RouteModelID:      provider.ModelID,
+				ProviderID:        provider.ID,
+				AttemptNo:         attempt + 1,
+				Strategy:          string(strategy),
+				Stage:             "cascade",
+				Decision:          "failed",
+				Success:           false,
+				ErrorType:         "execute_error",
+				ErrorMessage:      err.Error(),
+				LatencyMs:         attemptLatency,
+			})
 
 			// 閲嶈瘯寤惰繜
 			if attempt < maxRetries-1 && retryDelay > 0 {
@@ -245,9 +335,23 @@ func (c *cascadeController) ExecuteWithStrategy(ctx context.Context, operation s
 		result.TotalLatencyMs = time.Since(startTime).Milliseconds()
 
 		// 璁板綍鎴愬姛鍒扮啍鏂櫒
-		if enableCircuitBreaker {
+		if enableCircuitBreaker && c.circuitBreaker != nil {
 			_ = c.circuitBreaker.RecordSuccess(ctx, provider.ID)
 		}
+		c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+			RequestID:         dispatchRequestIDFromContext(ctx),
+			Operation:         operation,
+			RequestedModelID:  modelID,
+			ResolvedModelID:   resolvedModelID,
+			RouteModelID:      provider.ModelID,
+			ProviderID:        provider.ID,
+			AttemptNo:         attempt + 1,
+			Strategy:          string(strategy),
+			Stage:             "cascade",
+			Decision:          "succeeded",
+			Success:           true,
+			LatencyMs:         attemptLatency,
+		})
 
 		return result, nil
 	}
@@ -288,9 +392,39 @@ func (c *cascadeController) ExecuteOnProvider(ctx context.Context, operation str
 	if enableCircuitBreaker && c.circuitBreaker != nil {
 		canExecute, err := c.circuitBreaker.CanExecute(ctx, provider.ID)
 		if err != nil {
+			c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+				RequestID:         dispatchRequestIDFromContext(ctx),
+				Operation:         operation,
+				RequestedModelID:  modelID,
+				ResolvedModelID:   resolvedModelID,
+				RouteModelID:      provider.ModelID,
+				ProviderID:        provider.ID,
+				AttemptNo:         1,
+				Strategy:          string(StrategyCostFirst),
+				Stage:             "health_gate",
+				Decision:          "rejected",
+				Success:           false,
+				ErrorType:         "circuit_check_error",
+				ErrorMessage:      err.Error(),
+			})
 			return nil, fmt.Errorf("熔断器检查失败: %w", err)
 		}
 		if !canExecute {
+			c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+				RequestID:         dispatchRequestIDFromContext(ctx),
+				Operation:         operation,
+				RequestedModelID:  modelID,
+				ResolvedModelID:   resolvedModelID,
+				RouteModelID:      provider.ModelID,
+				ProviderID:        provider.ID,
+				AttemptNo:         1,
+				Strategy:          string(StrategyCostFirst),
+				Stage:             "health_gate",
+				Decision:          "rejected",
+				Success:           false,
+				ErrorType:         "circuit_open",
+				ErrorMessage:      "circuit_open",
+			})
 			return nil, fmt.Errorf("源头 %d 熔断器打开", provider.ID)
 		}
 	}
@@ -298,6 +432,21 @@ func (c *cascadeController) ExecuteOnProvider(ctx context.Context, operation str
 	if c.rateLimiter != nil {
 		allowed, err := c.rateLimiter.Allow(ctx, provider.ID, operation)
 		if err == nil && !allowed {
+			c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+				RequestID:         dispatchRequestIDFromContext(ctx),
+				Operation:         operation,
+				RequestedModelID:  modelID,
+				ResolvedModelID:   resolvedModelID,
+				RouteModelID:      provider.ModelID,
+				ProviderID:        provider.ID,
+				AttemptNo:         1,
+				Strategy:          string(StrategyCostFirst),
+				Stage:             "health_gate",
+				Decision:          "rejected",
+				Success:           false,
+				ErrorType:         "rate_limit",
+				ErrorMessage:      "rate_limit",
+			})
 			return nil, &ProviderRateLimitedError{ProviderID: provider.ID, Operation: operation}
 		}
 	}
@@ -321,6 +470,22 @@ func (c *cascadeController) ExecuteOnProvider(ctx context.Context, operation str
 			_ = c.circuitBreaker.RecordFailure(ctx, provider.ID, err)
 		}
 		_ = c.providerRepo.IncrementStats(ctx, provider.ID, false, attemptLatency, 0, 0, decimal.Zero)
+		c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+			RequestID:         dispatchRequestIDFromContext(ctx),
+			Operation:         operation,
+			RequestedModelID:  modelID,
+			ResolvedModelID:   resolvedModelID,
+			RouteModelID:      provider.ModelID,
+			ProviderID:        provider.ID,
+			AttemptNo:         1,
+			Strategy:          string(StrategyCostFirst),
+			Stage:             "cascade",
+			Decision:          "failed",
+			Success:           false,
+			ErrorType:         "execute_error",
+			ErrorMessage:      err.Error(),
+			LatencyMs:         attemptLatency,
+		})
 		return result, err
 	}
 
@@ -331,6 +496,20 @@ func (c *cascadeController) ExecuteOnProvider(ctx context.Context, operation str
 	if enableCircuitBreaker && c.circuitBreaker != nil {
 		_ = c.circuitBreaker.RecordSuccess(ctx, provider.ID)
 	}
+	c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+		RequestID:         dispatchRequestIDFromContext(ctx),
+		Operation:         operation,
+		RequestedModelID:  modelID,
+		ResolvedModelID:   resolvedModelID,
+		RouteModelID:      provider.ModelID,
+		ProviderID:        provider.ID,
+		AttemptNo:         1,
+		Strategy:          string(StrategyCostFirst),
+		Stage:             "cascade",
+		Decision:          "succeeded",
+		Success:           true,
+		LatencyMs:         attemptLatency,
+	})
 
 	return result, nil
 }
@@ -357,7 +536,7 @@ func (c *cascadeController) executeWithInstanceSelection(ctx context.Context, pr
 		c.attachSelectedInstance(timeoutCtx, provider, operation)
 
 		// 鎵ц璇锋眰
-		response, err := executor(timeoutCtx, provider)
+		response, err := c.executeRequestViaAdapter(timeoutCtx, operation, provider, executor)
 		resultCh <- result{response: response, err: err}
 	}()
 
@@ -372,12 +551,191 @@ func (c *cascadeController) executeWithInstanceSelection(ctx context.Context, pr
 	}
 }
 
+func (c *cascadeController) executeRequestViaAdapter(ctx context.Context, operation string, provider *model.ModelProvider, executor RequestExecutor) (interface{}, error) {
+	if executor == nil {
+		return nil, fmt.Errorf("RequestExecutor 不能为空")
+	}
+	if c == nil || c.sourceAdapterRegistry == nil {
+		return executor(ctx, provider)
+	}
+
+	adapter := c.sourceAdapterRegistry.Resolve(operation, provider)
+	if adapter == nil {
+		return executor(ctx, provider)
+	}
+
+	return adapter.Execute(ctx, &AdapterRequest{
+		Operation: operation,
+		Provider:  provider,
+		Executor:  executor,
+	})
+}
+
 // getProviderName 鑾峰彇婧愬ご鍚嶇О
 func (c *cascadeController) getProviderName(provider *model.ModelProvider) string {
 	if provider.Channel != nil {
 		return provider.Channel.Name
 	}
 	return fmt.Sprintf("Provider-%d", provider.ID)
+}
+
+func (c *cascadeController) buildProvidersForDispatch(ctx context.Context, operation string, requestModelID string, strategy SelectionStrategy) (string, []*model.ModelProvider, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	resolvedModelID := requestModelID
+	var err error
+	if c.modelAggregator != nil {
+		resolvedModelID, err = c.modelAggregator.ResolveModelAlias(ctx, requestModelID)
+		if err != nil {
+			return "", nil, fmt.Errorf("解析模型别名失败: %w", err)
+		}
+	}
+	if err := c.ensureModelCapability(ctx, resolvedModelID, operation); err != nil {
+		return "", nil, err
+	}
+
+	routeModels, err := c.resolveRouteModels(ctx, operation, resolvedModelID)
+	if err != nil {
+		return "", nil, err
+	}
+	if c.providerRepo == nil {
+		return "", nil, fmt.Errorf("provider repository 未配置")
+	}
+
+	merged := make([]*model.ModelProvider, 0)
+	seenProviders := make(map[uint]struct{})
+	totalConstraintReject := 0
+	totalSourceCandidates := 0
+
+	for _, routeModelID := range routeModels {
+		providers, err := c.providerRepo.GetByModelID(ctx, operation, routeModelID)
+		if err != nil {
+			return "", nil, fmt.Errorf("获取路由源头失败(model=%s): %w", routeModelID, err)
+		}
+		if len(providers) == 0 {
+			continue
+		}
+
+		totalSourceCandidates += len(providers)
+		matchedProviders := providers
+		if c.capabilityMatcher != nil {
+			filtered, rejected, err := c.capabilityMatcher.MatchProviders(ctx, operation, providers)
+			if err != nil {
+				return "", nil, fmt.Errorf("能力约束匹配失败(model=%s): %w", routeModelID, err)
+			}
+			totalConstraintReject += len(rejected)
+			matchedProviders = filtered
+		}
+		if len(matchedProviders) == 0 {
+			continue
+		}
+
+		healthyProviders := c.applyHealthGate(matchedProviders)
+		if len(healthyProviders) == 0 {
+			continue
+		}
+
+		ranked := c.rankProviders(operation, strategy, healthyProviders)
+		for _, provider := range ranked {
+			if provider == nil {
+				continue
+			}
+			if _, exists := seenProviders[provider.ID]; exists {
+				continue
+			}
+			seenProviders[provider.ID] = struct{}{}
+			merged = append(merged, provider)
+		}
+	}
+
+	if len(merged) == 0 && totalSourceCandidates > 0 && totalConstraintReject > 0 && totalConstraintReject >= totalSourceCandidates {
+		return resolvedModelID, nil, &ModelOperationNotSupportedError{
+			Operation: operation,
+			ModelID:   resolvedModelID,
+		}
+	}
+
+	return resolvedModelID, merged, nil
+}
+
+func (c *cascadeController) resolveRouteModels(ctx context.Context, operation string, resolvedModelID string) ([]string, error) {
+	if c.routeResolver == nil {
+		return []string{resolvedModelID}, nil
+	}
+
+	routeModels, err := c.routeResolver.ResolveRouteModels(ctx, operation, resolvedModelID)
+	if err != nil {
+		return nil, fmt.Errorf("解析路由失败: %w", err)
+	}
+	if len(routeModels) == 0 {
+		return []string{resolvedModelID}, nil
+	}
+	return routeModels, nil
+}
+
+func (c *cascadeController) applyHealthGate(providers []*model.ModelProvider) []*model.ModelProvider {
+	if len(providers) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	filtered := make([]*model.ModelProvider, 0, len(providers))
+	for _, provider := range providers {
+		if provider == nil {
+			continue
+		}
+		if provider.Status != model.ModelProviderStatusActive {
+			continue
+		}
+		if provider.CircuitState == model.CircuitStateOpen {
+			if provider.CircuitOpenUntil == nil || now.Before(*provider.CircuitOpenUntil) {
+				continue
+			}
+		}
+		filtered = append(filtered, provider)
+	}
+
+	return filtered
+}
+
+func (c *cascadeController) rankProviders(operation string, strategy SelectionStrategy, providers []*model.ModelProvider) []*model.ModelProvider {
+	if len(providers) <= 1 {
+		result := make([]*model.ModelProvider, len(providers))
+		copy(result, providers)
+		return result
+	}
+
+	ranked := make([]*model.ModelProvider, len(providers))
+	copy(ranked, providers)
+
+	selector, ok := c.selector.(*providerSelector)
+	if !ok {
+		return ranked
+	}
+
+	switch strategy {
+	case StrategyLatencyFirst:
+		selector.sortByLatency(ranked)
+	case StrategyHealthFirst:
+		selector.sortByHealth(ranked)
+	case StrategyRoundRobin:
+		selector.applyRoundRobin(operation, ranked)
+	case StrategyWeighted:
+		selector.applyWeighted(ranked)
+	default:
+		selector.sortByCost(context.Background(), operation, ranked)
+	}
+
+	return ranked
+}
+
+func (c *cascadeController) recordDispatchAttempt(ctx context.Context, attempt *model.DispatchAttempt) {
+	if c == nil || c.dispatchAttemptRepo == nil || attempt == nil {
+		return
+	}
+	_ = c.dispatchAttemptRepo.Create(ctx, attempt)
 }
 
 func (c *cascadeController) ensureModelCapability(ctx context.Context, modelID string, operation string) error {
@@ -653,21 +1011,13 @@ func (c *cascadeController) executeRequestWithGuard(ctx context.Context, provide
 
 func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, operation string, modelID string, strategy SelectionStrategy, executor StreamExecutor) (*CascadeResult, error) {
 	operation = model.NormalizeOperation(operation)
-
-	// ExecuteStreamWithFailover 鎵ц娴佸紡璇锋眰骞舵敮鎸侀鍖呰秴鏃?failover
-	// ? 棣栧寘瀹氫箟锛氱敱 StreamExecutor 鍦ㄢ€滈鏉?data: 鍐欏叆骞?Flush鈥濆悗瑙﹀彂 onFirstChunk 鍥炶皟
-	// 鏍规嵁鏋舵瀯璁捐锛?// - 棣栧寘鍒拌揪鍓嶏細鍏佽 failover 鍒颁笅涓€涓簮澶?// - 棣栧寘鍒拌揪鍚庯細閿佸畾褰撳墠婧愬ご锛屼笉鍐嶅垏鎹?func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, modelID string, strategy SelectionStrategy, executor StreamExecutor) (*CascadeResult, error) {
 	startTime := time.Now()
 
-	resolvedModelID, err := c.modelAggregator.ResolveModelAlias(ctx, modelID)
+	resolvedModelID, providers, err := c.buildProvidersForDispatch(ctx, operation, modelID, strategy)
 	if err != nil {
-		return nil, fmt.Errorf("瑙ｆ瀽妯″瀷鍒悕澶辫触: %w", err)
+		return nil, err
 	}
 
-	providers, err := c.selector.SelectProviders(ctx, operation, resolvedModelID, strategy)
-	if err != nil {
-		return nil, fmt.Errorf("鑾峰彇婧愬ご鍒楄〃澶辫触: %w", err)
-	}
 	if len(providers) == 0 {
 		return nil, &NoAvailableProviderError{Operation: operation, ModelID: modelID}
 	}
@@ -694,7 +1044,7 @@ func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, opera
 		result.UsedProviders = append(result.UsedProviders, provider.ID)
 		result.AttemptCount++
 
-		if enableCircuitBreaker {
+		if enableCircuitBreaker && c.circuitBreaker != nil {
 			canExecute, err := c.circuitBreaker.CanExecute(ctx, provider.ID)
 			if err != nil {
 				lastError = fmt.Errorf("鐔旀柇鍣ㄦ鏌ュけ璐? %w", err)
@@ -702,6 +1052,21 @@ func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, opera
 					ProviderID: provider.ID,
 					Error:      lastError.Error(),
 					LatencyMs:  0,
+				})
+				c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+					RequestID:        dispatchRequestIDFromContext(ctx),
+					Operation:        operation,
+					RequestedModelID: modelID,
+					ResolvedModelID:  resolvedModelID,
+					RouteModelID:     provider.ModelID,
+					ProviderID:       provider.ID,
+					AttemptNo:        attempt + 1,
+					Strategy:         string(strategy),
+					Stage:            "health_gate",
+					Decision:         "rejected",
+					Success:          false,
+					ErrorType:        "circuit_check_error",
+					ErrorMessage:     lastError.Error(),
 				})
 				continue
 			}
@@ -711,6 +1076,21 @@ func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, opera
 					ProviderID: provider.ID,
 					Error:      "鐔旀柇鍣ㄦ墦寮€",
 					LatencyMs:  0,
+				})
+				c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+					RequestID:        dispatchRequestIDFromContext(ctx),
+					Operation:        operation,
+					RequestedModelID: modelID,
+					ResolvedModelID:  resolvedModelID,
+					RouteModelID:     provider.ModelID,
+					ProviderID:       provider.ID,
+					AttemptNo:        attempt + 1,
+					Strategy:         string(strategy),
+					Stage:            "health_gate",
+					Decision:         "rejected",
+					Success:          false,
+					ErrorType:        "circuit_open",
+					ErrorMessage:     "circuit_open",
 				})
 				continue
 			}
@@ -726,12 +1106,27 @@ func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, opera
 					Error:        "rate_limit",
 					LatencyMs:    0,
 				})
+				c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+					RequestID:        dispatchRequestIDFromContext(ctx),
+					Operation:        operation,
+					RequestedModelID: modelID,
+					ResolvedModelID:  resolvedModelID,
+					RouteModelID:     provider.ModelID,
+					ProviderID:       provider.ID,
+					AttemptNo:        attempt + 1,
+					Strategy:         string(strategy),
+					Stage:            "health_gate",
+					Decision:         "rejected",
+					Success:          false,
+					ErrorType:        "rate_limit",
+					ErrorMessage:     "rate_limit",
+				})
 				continue
 			}
 		}
 
 		attemptStart := time.Now()
-		canFailover, err := c.executeStreamWithGuard(ctx, provider, executor)
+		canFailover, err := c.executeStreamWithGuard(ctx, provider, operation, executor)
 		attemptLatency := time.Since(attemptStart).Milliseconds()
 
 		if err != nil {
@@ -743,10 +1138,26 @@ func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, opera
 				LatencyMs:    attemptLatency,
 			})
 
-			if enableCircuitBreaker {
+			if enableCircuitBreaker && c.circuitBreaker != nil {
 				_ = c.circuitBreaker.RecordFailure(ctx, provider.ID, err)
 			}
 			_ = c.providerRepo.IncrementStats(ctx, provider.ID, false, attemptLatency, 0, 0, decimal.Zero)
+			c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+				RequestID:        dispatchRequestIDFromContext(ctx),
+				Operation:        operation,
+				RequestedModelID: modelID,
+				ResolvedModelID:  resolvedModelID,
+				RouteModelID:     provider.ModelID,
+				ProviderID:       provider.ID,
+				AttemptNo:        attempt + 1,
+				Strategy:         string(strategy),
+				Stage:            "cascade",
+				Decision:         "failed",
+				Success:          false,
+				ErrorType:        "execute_error",
+				ErrorMessage:     err.Error(),
+				LatencyMs:        attemptLatency,
+			})
 
 			if !canFailover {
 				result.TotalLatencyMs = time.Since(startTime).Milliseconds()
@@ -764,9 +1175,23 @@ func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, opera
 		result.Provider = provider
 		result.TotalLatencyMs = time.Since(startTime).Milliseconds()
 
-		if enableCircuitBreaker {
+		if enableCircuitBreaker && c.circuitBreaker != nil {
 			_ = c.circuitBreaker.RecordSuccess(ctx, provider.ID)
 		}
+		c.recordDispatchAttempt(ctx, &model.DispatchAttempt{
+			RequestID:        dispatchRequestIDFromContext(ctx),
+			Operation:        operation,
+			RequestedModelID: modelID,
+			ResolvedModelID:  resolvedModelID,
+			RouteModelID:     provider.ModelID,
+			ProviderID:       provider.ID,
+			AttemptNo:        attempt + 1,
+			Strategy:         string(strategy),
+			Stage:            "cascade",
+			Decision:         "succeeded",
+			Success:          true,
+			LatencyMs:        attemptLatency,
+		})
 
 		return result, nil
 	}
@@ -828,7 +1253,7 @@ func (c *cascadeController) executeStreamWithGuard(ctx context.Context, provider
 	errCh := make(chan error, 1)
 	go func() {
 		c.attachSelectedInstance(attemptCtx, provider, operation)
-		errCh <- executor(attemptCtx, provider, onFirstChunk)
+		errCh <- c.executeStreamViaAdapter(attemptCtx, operation, provider, executor, onFirstChunk)
 	}()
 
 	firstChunkTimeoutCh := firstChunkTimer.C
@@ -863,6 +1288,17 @@ func (c *cascadeController) executeStreamWithGuard(ctx context.Context, provider
 			return !locked, attemptCtx.Err()
 		}
 	}
+}
+
+func (c *cascadeController) executeStreamViaAdapter(ctx context.Context, operation string, provider *model.ModelProvider, executor StreamExecutor, onFirstChunk func()) error {
+	if executor == nil {
+		return fmt.Errorf("StreamExecutor 不能为空")
+	}
+
+	// 预留 SourceAdapter 的流式扩展点：
+	// 当前仍透传至既有 StreamExecutor，后续在这里接入统一流式协议适配。
+	_ = operation
+	return executor(ctx, provider, onFirstChunk)
 }
 
 // attachSelectedInstance 涓?provider 閫夋嫨骞剁粦瀹氬疄渚嬶紝骞剁‘淇濇墽琛岀粨鏉熷悗閲婃斁骞跺彂妲戒綅

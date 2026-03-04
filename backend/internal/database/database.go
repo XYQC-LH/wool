@@ -92,6 +92,7 @@ func AutoMigrate() error {
 		&model.ProviderMetrics{},
 		&model.CircuitEventRecord{},
 		&model.ModelRoute{}, // 路由表（RouteKey = operation + model_id）
+		&model.DispatchAttempt{},
 
 		// ⭐ 源头实例（号池调度支持）
 		&model.ProviderInstance{},

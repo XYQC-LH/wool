@@ -40,8 +40,11 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	providerMetricsRepo := repository.NewProviderMetricsRepository(db)
 	providerInstanceRepo := repository.NewProviderInstanceRepository(db)
 	modelCapabilityRepo := repository.NewModelCapabilityRepository(db)
+	modelRouteRepo := repository.NewModelRouteRepository(db)
+	providerCapabilityRepo := repository.NewProviderCapabilityRepository(db)
 	providerPricingRuleRepo := repository.NewProviderPricingRuleRepository(db)
 	providerRateLimitRuleRepo := repository.NewProviderRateLimitRuleRepository(db)
+	dispatchAttemptRepo := repository.NewDispatchAttemptRepository(db)
 
 	// ==================== Infra ====================
 	objStore, err := storage.NewObjectStorage(cfg.OSS)
@@ -53,6 +56,11 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	runtimeStateStore := scheduler.NewRuntimeStateStore()
 	providerSelector := scheduler.NewProviderSelector(modelProviderRepo, providerPricingRuleRepo)
 	modelAggregator := scheduler.NewModelAggregator(modelProviderRepo, modelAliasRepo)
+	routeResolver := scheduler.NewRouteResolver(modelRouteRepo)
+	capabilityMatcher := scheduler.NewCapabilityMatcher(providerCapabilityRepo)
+	sourceAdapterRegistry := scheduler.NewSourceAdapterRegistry(
+		scheduler.NewOpenAICompatibleAdapter(),
+	)
 	providerRateLimiter := scheduler.NewProviderRateLimiter(providerRateLimitRuleRepo, nil)
 	commitGuard := scheduler.NewCommitGuard(runtimeStateStore, nil)
 	streamGuard := commitGuard
@@ -71,8 +79,12 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		commitGuard,
 		modelAggregator,
 		modelCapabilityRepo,
+		capabilityMatcher,
+		routeResolver,
+		dispatchAttemptRepo,
 		providerRateLimiter,
 		nil,
+		sourceAdapterRegistry,
 	)
 
 	// ==================== Service ====================
@@ -142,7 +154,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	}
 
 	r := gin.New()
-	r.Use(gin.Recovery())
+	r.Use(middleware.RecoveryMiddleware())
 	r.Use(middleware.LoggerMiddleware())
 	r.Use(middleware.CORSMiddleware())
 	r.Use(middleware.PrometheusMiddleware())

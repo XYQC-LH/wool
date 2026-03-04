@@ -58,9 +58,12 @@ func main() {
 	modelRepo := repository.NewModelRepository(db)
 	modelAliasRepo := repository.NewModelAliasRepository(db)
 	modelCapabilityRepo := repository.NewModelCapabilityRepository(db)
+	modelRouteRepo := repository.NewModelRouteRepository(db)
+	providerCapabilityRepo := repository.NewProviderCapabilityRepository(db)
 	modelProviderRepo := repository.NewModelProviderRepository(db)
 	providerMetricsRepo := repository.NewProviderMetricsRepository(db)
 	providerInstanceRepo := repository.NewProviderInstanceRepository(db)
+	dispatchAttemptRepo := repository.NewDispatchAttemptRepository(db)
 	generationRepo := repository.NewGenerationRepository(db)
 	idempotencyRepo := repository.NewIdempotencyKeyRepository(db)
 	pricingRuleRepo := repository.NewProviderPricingRuleRepository(db)
@@ -76,6 +79,11 @@ func main() {
 	runtimeStateStore := scheduler.NewRuntimeStateStore()
 	providerSelector := scheduler.NewProviderSelector(modelProviderRepo, pricingRuleRepo)
 	modelAggregator := scheduler.NewModelAggregator(modelProviderRepo, modelAliasRepo)
+	routeResolver := scheduler.NewRouteResolver(modelRouteRepo)
+	capabilityMatcher := scheduler.NewCapabilityMatcher(providerCapabilityRepo)
+	sourceAdapterRegistry := scheduler.NewSourceAdapterRegistry(
+		scheduler.NewOpenAICompatibleAdapter(),
+	)
 	providerRateLimiter := scheduler.NewProviderRateLimiter(rateLimitRuleRepo, nil)
 	commitGuard := scheduler.NewCommitGuard(runtimeStateStore, nil)
 	instanceScheduler := scheduler.NewInstanceScheduler(providerInstanceRepo, rateLimitRuleRepo, runtimeStateStore, nil)
@@ -90,8 +98,12 @@ func main() {
 		commitGuard,
 		modelAggregator,
 		modelCapabilityRepo,
+		capabilityMatcher,
+		routeResolver,
+		dispatchAttemptRepo,
 		providerRateLimiter,
 		nil,
+		sourceAdapterRegistry,
 	)
 
 	// ==================== Service ====================
