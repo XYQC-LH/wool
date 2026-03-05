@@ -41,6 +41,7 @@ type gatewayServiceV2 struct {
 	streamGuard       scheduler.StreamGuard
 	healthTracker     scheduler.HealthTracker
 	costCalculator    scheduler.CostCalculator
+	tenantBillingHook TenantBillingHook
 }
 
 // NewGatewayServiceV2 创建增强版 Gateway 服务
@@ -62,6 +63,7 @@ func NewGatewayServiceV2(
 	healthTracker scheduler.HealthTracker,
 	costCalculator scheduler.CostCalculator,
 	errorClassifier scheduler.ErrorClassifier,
+	tenantBillingHook TenantBillingHook,
 ) GatewayService {
 	cascadeMetrics := scheduler.NewCascadeMetrics()
 
@@ -85,6 +87,7 @@ func NewGatewayServiceV2(
 		streamGuard:       streamGuard,
 		healthTracker:     healthTracker,
 		costCalculator:    costCalculator,
+		tenantBillingHook: tenantBillingHook,
 	}
 }
 
@@ -145,6 +148,10 @@ func (s *gatewayServiceV2) HandleChatCompletion(req *ChatCompletionRequest, toke
 		return nil, err
 	}
 
+	if err := s.checkTenantQuota(ctx, token, estimatedCost); err != nil {
+		return nil, err
+	}
+
 	if token.User != nil && token.User.Balance.LessThan(estimatedCost) {
 		return nil, &InsufficientFundsError{Needed: estimatedCost, Balance: token.User.Balance}
 	}
@@ -197,6 +204,7 @@ func (s *gatewayServiceV2) handleChatCompletionWithScheduler(ctx context.Context
 		}
 		_ = s.providerRepo.IncrementStats(ctx, result.Provider.ID, true, result.TotalLatencyMs, int64(chatResp.Usage.PromptTokens), int64(chatResp.Usage.CompletionTokens), upstreamCost)
 		s.logProviderRequest(token, result.Provider, model.OperationChatCompletions, req.Model, chatResp.Usage, cost, upstreamCost, int(result.TotalLatencyMs), model.LogStatusSuccess, "")
+		s.emitTenantBilling(ctx, token, model.OperationChatCompletions, req.Model, chatResp.Usage, cost)
 	}
 
 	return chatResp, nil
@@ -301,6 +309,10 @@ func (s *gatewayServiceV2) handleStreamWithScheduler(ctx context.Context, req *C
 	estimatedCompletionTokens := s.costCalculator.EstimateCompletionTokens(schedulerReq)
 	estimatedCost, _ := s.costCalculator.CalculateCost(req.Model, estimatedPromptTokens, estimatedCompletionTokens)
 
+	if err := s.checkTenantQuota(ctx, token, estimatedCost); err != nil {
+		return err
+	}
+
 	if token.User != nil && token.User.Balance.LessThan(estimatedCost) {
 		return &InsufficientFundsError{Needed: estimatedCost, Balance: token.User.Balance}
 	}
@@ -350,6 +362,7 @@ func (s *gatewayServiceV2) handleStreamWithScheduler(ctx context.Context, req *C
 	}
 
 	s.logProviderRequest(token, provider, model.OperationChatCompletions, req.Model, usage, cost, upstreamCost, latency, model.LogStatusSuccess, "")
+	s.emitTenantBilling(ctx, token, model.OperationChatCompletions, req.Model, usage, cost)
 	return nil
 }
 
@@ -359,6 +372,12 @@ func (s *gatewayServiceV2) handleStreamWithScheduler(ctx context.Context, req *C
 func (s *gatewayServiceV2) HandleCompletion(req *CompletionRequest, token *model.Token) (*CompletionResponse, error) {
 	startTime := time.Now()
 	ctx := context.Background()
+	estimatedPromptTokens, estimatedCompletionTokens := estimateCompletionTokens(req)
+	estimatedCost, _ := s.costCalculator.CalculateCost(req.Model, estimatedPromptTokens, estimatedCompletionTokens)
+
+	if err := s.checkTenantQuota(ctx, token, estimatedCost); err != nil {
+		return nil, err
+	}
 
 	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
 		if execCtx == nil {
@@ -402,8 +421,7 @@ func (s *gatewayServiceV2) HandleCompletion(req *CompletionRequest, token *model
 
 	operation := model.OperationCompletions
 	usedOperation := operation
-	promptTokens, completionTokens := estimateCompletionTokens(req)
-	rateCtx := scheduler.WithRateLimitUsage(ctx, buildTokenRateLimitUsage(promptTokens, completionTokens))
+	rateCtx := scheduler.WithRateLimitUsage(ctx, buildTokenRateLimitUsage(estimatedPromptTokens, estimatedCompletionTokens))
 	result, err := s.cascadeController.ExecuteWithStrategy(rateCtx, operation, req.Model, scheduler.StrategyCostFirst, executor)
 	if err != nil {
 		var noProviders *scheduler.NoAvailableProviderError
@@ -451,6 +469,7 @@ func (s *gatewayServiceV2) HandleCompletion(req *CompletionRequest, token *model
 		_ = s.providerRepo.IncrementStats(ctx, result.Provider.ID, true, int64(latencyMs), int64(usage.PromptTokens), int64(usage.CompletionTokens), upstreamCost)
 	}
 	s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, cost, upstreamCost, latencyMs, model.LogStatusSuccess, "")
+	s.emitTenantBilling(ctx, token, usedOperation, req.Model, usage, cost)
 
 	return completionResp, nil
 }
@@ -459,6 +478,12 @@ func (s *gatewayServiceV2) HandleCompletion(req *CompletionRequest, token *model
 func (s *gatewayServiceV2) HandleEmbedding(req *EmbeddingRequest, token *model.Token) (*EmbeddingResponse, error) {
 	startTime := time.Now()
 	ctx := context.Background()
+	estimatedPromptTokens := estimateEmbeddingTokens(req)
+	estimatedCost, _ := s.costCalculator.CalculateCost(req.Model, estimatedPromptTokens, 0)
+
+	if err := s.checkTenantQuota(ctx, token, estimatedCost); err != nil {
+		return nil, err
+	}
 
 	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
 		if execCtx == nil {
@@ -502,8 +527,7 @@ func (s *gatewayServiceV2) HandleEmbedding(req *EmbeddingRequest, token *model.T
 
 	operation := model.OperationEmbeddings
 	usedOperation := operation
-	promptTokens := estimateEmbeddingTokens(req)
-	rateCtx := scheduler.WithRateLimitUsage(ctx, buildTokenRateLimitUsage(promptTokens, 0))
+	rateCtx := scheduler.WithRateLimitUsage(ctx, buildTokenRateLimitUsage(estimatedPromptTokens, 0))
 	result, err := s.cascadeController.ExecuteWithStrategy(rateCtx, operation, req.Model, scheduler.StrategyCostFirst, executor)
 	if err != nil {
 		var noProviders *scheduler.NoAvailableProviderError
@@ -551,6 +575,7 @@ func (s *gatewayServiceV2) HandleEmbedding(req *EmbeddingRequest, token *model.T
 		_ = s.providerRepo.IncrementStats(ctx, result.Provider.ID, true, int64(latencyMs), int64(usage.PromptTokens), int64(usage.CompletionTokens), upstreamCost)
 	}
 	s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, cost, upstreamCost, latencyMs, model.LogStatusSuccess, "")
+	s.emitTenantBilling(ctx, token, usedOperation, req.Model, usage, cost)
 
 	return embeddingResp, nil
 }
@@ -658,6 +683,9 @@ func (s *gatewayServiceV2) executeStreamRequest(ctx context.Context, provider *m
 
 // logProviderRequest 记录Provider请求日志
 func (s *gatewayServiceV2) logProviderRequest(token *model.Token, provider *model.ModelProvider, operation string, modelName string, usage *Usage, cost, upstreamCost decimal.Decimal, latency int, status model.LogStatus, errMsg string) {
+	if token == nil {
+		return
+	}
 	if usage == nil {
 		usage = &Usage{}
 	}
@@ -667,6 +695,15 @@ func (s *gatewayServiceV2) logProviderRequest(token *model.Token, provider *mode
 	var metadata model.JSON
 	if strings.TrimSpace(op) != "" {
 		metadata = model.JSON{"operation": op}
+	}
+	if token != nil {
+		tenantID := strings.TrimSpace(token.EffectiveTenantID())
+		if tenantID != "" {
+			if metadata == nil {
+				metadata = model.JSON{}
+			}
+			metadata["tenant_id"] = tenantID
+		}
 	}
 
 	log := &model.Log{
@@ -687,6 +724,44 @@ func (s *gatewayServiceV2) logProviderRequest(token *model.Token, provider *mode
 		log.ChannelID = provider.Channel.ID
 	}
 	_ = s.logRepo.Create(log)
+}
+
+func (s *gatewayServiceV2) checkTenantQuota(ctx context.Context, token *model.Token, estimatedCost decimal.Decimal) error {
+	if s == nil || s.tenantBillingHook == nil || token == nil {
+		return nil
+	}
+
+	tenantID := strings.TrimSpace(token.EffectiveTenantID())
+	if tenantID == "" {
+		return nil
+	}
+
+	return s.tenantBillingHook.CheckQuota(ctx, tenantID, estimatedCost)
+}
+
+func (s *gatewayServiceV2) emitTenantBilling(ctx context.Context, token *model.Token, operation string, modelName string, usage *Usage, cost decimal.Decimal) {
+	if s == nil || s.tenantBillingHook == nil || token == nil {
+		return
+	}
+	tenantID := strings.TrimSpace(token.EffectiveTenantID())
+	if tenantID == "" {
+		return
+	}
+	if usage == nil {
+		usage = &Usage{}
+	}
+
+	_ = s.tenantBillingHook.OnBilled(ctx, &TenantBillingEvent{
+		TenantID:         tenantID,
+		UserID:           token.UserID,
+		TokenID:          token.ID,
+		Operation:        model.NormalizeOperation(operation),
+		Model:            modelName,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		Cost:             cost,
+		OccurredAt:       time.Now(),
+	})
 }
 
 func buildTokenRateLimitUsage(promptTokens, completionTokens int) map[string]int64 {

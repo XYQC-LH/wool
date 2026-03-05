@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -100,6 +101,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	modelService := service.NewModelService(modelRepo)
 	alertService := service.NewAlertService(alertRepo)
 	settingsService := service.NewSettingsService(systemSettingRepo)
+	tenantBillingHook := service.NewTenantBillingHook(cfg.RateLimit)
 
 	// 主网关实现：Gateway v2
 	gatewayService := service.NewGatewayServiceV2(
@@ -120,6 +122,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		healthTracker,
 		costCalculator,
 		errorClassifier,
+		tenantBillingHook,
 	)
 
 	modelProviderService := service.NewModelProviderService(
@@ -131,6 +134,10 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		circuitBreaker,
 		healthTracker,
 	)
+	adminTokenService, ok := tokenService.(service.AdminTokenService)
+	if !ok {
+		return nil, errors.New("token service 不支持管理员接口")
+	}
 
 	// ==================== Handler ====================
 	userHandler := handler.NewUserHandler(userService, tokenService, orderService, logService, modelService, announcementService)
@@ -147,6 +154,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	modelCapabilityHandler := handler.NewModelCapabilityHandler(modelCapabilityRepo)
 	providerPricingRuleHandler := handler.NewProviderPricingRuleHandler(providerPricingRuleRepo)
 	providerRateLimitRuleHandler := handler.NewProviderRateLimitRuleHandler(providerRateLimitRuleRepo)
+	adminTokenHandler := handler.NewAdminTokenHandler(adminTokenService)
 
 	// ==================== Router ====================
 	if cfg.Server.Mode == "release" {
@@ -316,6 +324,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		modelCapabilityHandler.RegisterRoutes(adminAPI)
 		providerPricingRuleHandler.RegisterRoutes(adminAPI)
 		providerRateLimitRuleHandler.RegisterRoutes(adminAPI)
+		adminTokenHandler.RegisterRoutes(adminAPI)
 		handler.RegisterTopologyRoutes(adminAPI, db)
 		handler.RegisterDispatchRoutes(adminAPI, db)
 		handler.RegisterFinanceRoutes(adminAPI, db)

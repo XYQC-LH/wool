@@ -2,6 +2,7 @@ package repository
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"nexus-api/internal/cache"
@@ -20,11 +21,50 @@ type TokenRepository interface {
 	GetByKeyWithUser(key string) (*model.Token, error)
 	Update(token *model.Token) error
 	Delete(id uuid.UUID) error
+	List(page, pageSize int, filters map[string]interface{}) ([]*model.Token, int64, error)
 	ListByUserID(userID uuid.UUID, page, pageSize int) ([]*model.Token, int64, error)
 	DeductQuota(id uuid.UUID, amount decimal.Decimal) error
 	UpdateLastUsed(id uuid.UUID) error
 	CountByUserID(userID uuid.UUID) (int64, error)
 	InvalidateCache(key string)
+}
+
+// List 获取 Token 列表（管理员）
+func (r *tokenRepository) List(page, pageSize int, filters map[string]interface{}) ([]*model.Token, int64, error) {
+	var tokens []*model.Token
+	var total int64
+
+	query := r.db.Model(&model.Token{})
+
+	if userID, ok := filters["user_id"]; ok {
+		query = query.Where("user_id = ?", userID)
+	}
+
+	if status, ok := filters["status"].(string); ok {
+		status = strings.TrimSpace(status)
+		if status != "" {
+			query = query.Where("status = ?", status)
+		}
+	}
+
+	if keyword, ok := filters["keyword"].(string); ok {
+		keyword = strings.TrimSpace(keyword)
+		if keyword != "" {
+			likeKeyword := "%" + keyword + "%"
+			query = query.Where("name LIKE ? OR key LIKE ?", likeKeyword, likeKeyword)
+		}
+	}
+
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	offset := (page - 1) * pageSize
+	if err := query.Offset(offset).Limit(pageSize).Order("created_at DESC").Find(&tokens).Error; err != nil {
+		return nil, 0, err
+	}
+
+	return tokens, total, nil
 }
 
 // tokenRepository Token 仓库实现

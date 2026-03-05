@@ -40,6 +40,30 @@ func (e *QuotaExceededError) Error() string {
 	return "Token配额不足"
 }
 
+// TenantQuotaExceededError 表示租户级日预算配额超限（业务错误，通常映射为 HTTP 429）。
+type TenantQuotaExceededError struct {
+	TenantID  string
+	Needed    decimal.Decimal
+	Current   decimal.Decimal
+	DailyLimit decimal.Decimal
+}
+
+func (e *TenantQuotaExceededError) Error() string {
+	if e == nil {
+		return "租户配额不足"
+	}
+	if e.DailyLimit.GreaterThan(decimal.Zero) {
+		return fmt.Sprintf(
+			"租户日预算超限，tenant=%s，当前 %.6f，需要 %.6f，日上限 %.6f",
+			e.TenantID,
+			e.Current.InexactFloat64(),
+			e.Needed.InexactFloat64(),
+			e.DailyLimit.InexactFloat64(),
+		)
+	}
+	return "租户配额不足"
+}
+
 // UpstreamAuthError 表示“上游鉴权失败”，通常是渠道 APIKey/凭证失效导致。
 // 这属于网关侧的配置错误，对下游建议映射为 502（Bad Gateway）。
 type UpstreamAuthError struct {

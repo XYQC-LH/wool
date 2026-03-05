@@ -23,6 +23,7 @@ type Token struct {
 	ID             uuid.UUID        `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
 	Key            string           `gorm:"type:varchar(64);uniqueIndex;not null" json:"key"`
 	UserID         uuid.UUID        `gorm:"type:uuid;not null;index" json:"user_id"`
+	TenantID       string           `gorm:"type:varchar(64);index" json:"tenant_id,omitempty"`
 	Name           string           `gorm:"type:varchar(100);not null" json:"name"`
 	RemainQuota    *decimal.Decimal `gorm:"type:decimal(12,4)" json:"remain_quota,omitempty"`
 	UnlimitedQuota bool             `gorm:"default:false" json:"unlimited_quota"`
@@ -60,6 +61,22 @@ func (t *Token) IsExpired() bool {
 		return false
 	}
 	return t.ExpiresAt.Before(time.Now())
+}
+
+// EffectiveTenantID 返回 Token 生效租户 ID。
+// 优先使用显式绑定 TenantID，缺省时回退到 UserID（兼容历史数据）。
+func (t *Token) EffectiveTenantID() string {
+	if t == nil {
+		return ""
+	}
+	tenantID := strings.TrimSpace(t.TenantID)
+	if tenantID != "" {
+		return tenantID
+	}
+	if t.UserID != uuid.Nil {
+		return t.UserID.String()
+	}
+	return ""
 }
 
 // HasQuota 检查是否有配额
@@ -107,6 +124,7 @@ func (t *Token) IsIPAllowed(ip string) bool {
 type TokenResponse struct {
 	ID             uuid.UUID        `json:"id"`
 	Key            string           `json:"key"`
+	TenantID       string           `json:"tenant_id,omitempty"`
 	Name           string           `json:"name"`
 	RemainQuota    *decimal.Decimal `json:"remain_quota,omitempty"`
 	UnlimitedQuota bool             `json:"unlimited_quota"`
@@ -139,6 +157,7 @@ func (t *Token) ToResponse() *TokenResponse {
 	return &TokenResponse{
 		ID:             t.ID,
 		Key:            maskedKey,
+		TenantID:       t.EffectiveTenantID(),
 		Name:           t.Name,
 		RemainQuota:    t.RemainQuota,
 		UnlimitedQuota: t.UnlimitedQuota,
@@ -165,10 +184,63 @@ type CreateTokenRequest struct {
 // UpdateTokenRequest 更新 Token 请求
 type UpdateTokenRequest struct {
 	Name          *string     `json:"name,omitempty" binding:"omitempty,min=1,max=100"`
-	Status        TokenStatus `json:"status,omitempty"`
+	Status        TokenStatus `json:"status,omitempty" binding:"omitempty,oneof=active disabled expired"`
 	Quota         *float64    `json:"quota,omitempty"`
 	ExpiresAt     *time.Time  `json:"expires_at,omitempty"`
 	RateLimit     *int        `json:"rate_limit,omitempty"`
 	AllowedModels *[]string   `json:"allowed_models,omitempty"`
 	AllowedIPs    *[]string   `json:"allowed_ips,omitempty"`
+}
+
+// AdminCreateTokenRequest 管理员创建 Token 请求
+type AdminCreateTokenRequest struct {
+	UserID        uuid.UUID   `json:"user_id" binding:"required"`
+	Name          string      `json:"name" binding:"required,min=1,max=100"`
+	Quota         *float64    `json:"quota,omitempty"`
+	ExpiresAt     *time.Time  `json:"expires_at,omitempty"`
+	AllowedModels []string    `json:"allowed_models,omitempty"`
+	AllowedIPs    []string    `json:"allowed_ips,omitempty"`
+	RateLimit     *int        `json:"rate_limit,omitempty"`
+	Status        TokenStatus `json:"status,omitempty" binding:"omitempty,oneof=active disabled expired"`
+}
+
+// AdminTokenResponse 管理员 Token 响应结构
+type AdminTokenResponse struct {
+	ID             uuid.UUID        `json:"id"`
+	Key            string           `json:"key"`
+	UserID         uuid.UUID        `json:"user_id"`
+	TenantID       string           `json:"tenant_id,omitempty"`
+	Name           string           `json:"name"`
+	RemainQuota    *decimal.Decimal `json:"remain_quota,omitempty"`
+	UnlimitedQuota bool             `json:"unlimited_quota"`
+	Status         TokenStatus      `json:"status"`
+	AllowedModels  []string         `json:"allowed_models,omitempty"`
+	AllowedIPs     []string         `json:"allowed_ips,omitempty"`
+	RateLimit      *int             `json:"rate_limit,omitempty"`
+	LastUsedAt     *time.Time       `json:"last_used_at,omitempty"`
+	ExpiresAt      *time.Time       `json:"expires_at,omitempty"`
+	CreatedAt      time.Time        `json:"created_at"`
+	Usage          *TokenUsageStats `json:"usage,omitempty"`
+}
+
+// ToAdminResponse 转换为管理员响应结构
+func (t *Token) ToAdminResponse() *AdminTokenResponse {
+	resp := t.ToResponse()
+	return &AdminTokenResponse{
+		ID:             resp.ID,
+		Key:            resp.Key,
+		UserID:         t.UserID,
+		TenantID:       resp.TenantID,
+		Name:           resp.Name,
+		RemainQuota:    resp.RemainQuota,
+		UnlimitedQuota: resp.UnlimitedQuota,
+		Status:         resp.Status,
+		AllowedModels:  resp.AllowedModels,
+		AllowedIPs:     resp.AllowedIPs,
+		RateLimit:      resp.RateLimit,
+		LastUsedAt:     resp.LastUsedAt,
+		ExpiresAt:      resp.ExpiresAt,
+		CreatedAt:      resp.CreatedAt,
+		Usage:          resp.Usage,
+	}
 }

@@ -185,6 +185,46 @@ func GatewayRateLimitMiddleware(cfg config.RateLimitConfig) gin.HandlerFunc {
 			}
 		}
 
+		tenantID, ok := GetCurrentTenantID(c)
+		if !ok {
+			tenantID = tokenInfo.EffectiveTenantID()
+		}
+		if tenantID != "" {
+			if cfg.TenantRequestsPerMinute > 0 {
+				tenantKey := fmt.Sprintf("rate:tenant:%s:gateway", tenantID)
+				tenantAllowed, err := cache.SlidingWindowRateLimit(tenantKey, int64(cfg.TenantRequestsPerMinute), time.Minute)
+				if err == nil && !tenantAllowed {
+					c.JSON(http.StatusTooManyRequests, model.NewOpenAIError(
+						"租户请求过于频繁，请稍后再试",
+						model.OpenAIErrorTypeRateLimit,
+						nil,
+					))
+					c.Abort()
+					return
+				}
+			}
+
+			if cfg.TenantRequestsPerDay > 0 {
+				today := time.Now().Format("2006-01-02")
+				tenantDailyKey := fmt.Sprintf("quota:tenant:daily:%s:%s", tenantID, today)
+				tenantDailyCount, err := cache.Incr(tenantDailyKey)
+				if err == nil {
+					if tenantDailyCount == 1 {
+						_ = cache.Expire(tenantDailyKey, 49*time.Hour)
+					}
+					if tenantDailyCount > int64(cfg.TenantRequestsPerDay) {
+						c.JSON(http.StatusTooManyRequests, model.NewOpenAIError(
+							"租户已达到每日请求配额上限",
+							model.OpenAIErrorTypeRateLimit,
+							nil,
+						))
+						c.Abort()
+						return
+					}
+				}
+			}
+		}
+
 		c.Next()
 	}
 }

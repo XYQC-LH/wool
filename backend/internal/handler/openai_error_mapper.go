@@ -43,6 +43,13 @@ func WriteOpenAIError(c *gin.Context, err error) {
 		return
 	}
 
+	var tenantQuotaExceeded *service.TenantQuotaExceededError
+	if errors.As(err, &tenantQuotaExceeded) {
+		code := "tenant_quota_exceeded"
+		writeOpenAIError(c, http.StatusTooManyRequests, tenantQuotaExceeded.Error(), model.OpenAIErrorTypeRateLimit, &code)
+		return
+	}
+
 	var upstreamAuth *service.UpstreamAuthError
 	if errors.As(err, &upstreamAuth) {
 		code := "upstream_auth_failed"

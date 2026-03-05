@@ -81,6 +81,9 @@ type RateLimitConfig struct {
 	BurstSize             int
 	IPRequestsPerMinute   int
 	UserRequestsPerMinute int
+	TenantRequestsPerMinute int
+	TenantRequestsPerDay    int
+	TenantDailyCostLimit    float64
 }
 
 // PaymentConfig 支付配置
@@ -190,10 +193,13 @@ func Load() (*Config, error) {
 			Issuer:      getEnv("JWT_ISSUER", "nexus-api-gateway"),
 		},
 		RateLimit: RateLimitConfig{
-			RequestsPerMinute:     getEnvInt("RATE_LIMIT_RPM", 60),
-			BurstSize:             getEnvInt("RATE_LIMIT_BURST", 10),
-			IPRequestsPerMinute:   getEnvInt("RATE_LIMIT_IP_RPM", 100),
-			UserRequestsPerMinute: getEnvInt("RATE_LIMIT_USER_RPM", 60),
+			RequestsPerMinute:       getEnvInt("RATE_LIMIT_RPM", 60),
+			BurstSize:               getEnvInt("RATE_LIMIT_BURST", 10),
+			IPRequestsPerMinute:     getEnvInt("RATE_LIMIT_IP_RPM", 100),
+			UserRequestsPerMinute:   getEnvInt("RATE_LIMIT_USER_RPM", 60),
+			TenantRequestsPerMinute: getEnvInt("RATE_LIMIT_TENANT_RPM", 600),
+			TenantRequestsPerDay:    getEnvInt("RATE_LIMIT_TENANT_DAILY_REQUESTS", 100000),
+			TenantDailyCostLimit:    getEnvFloat("RATE_LIMIT_TENANT_DAILY_COST", 0),
 		},
 		Payment: PaymentConfig{
 			StripeSecretKey:      getEnv("STRIPE_SECRET_KEY", ""),
@@ -237,6 +243,16 @@ func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intValue, err := strconv.Atoi(value); err == nil {
 			return intValue
+		}
+	}
+	return defaultValue
+}
+
+// getEnvFloat 获取浮点数环境变量
+func getEnvFloat(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if floatValue, err := strconv.ParseFloat(value, 64); err == nil {
+			return floatValue
 		}
 	}
 	return defaultValue

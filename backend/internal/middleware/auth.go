@@ -20,6 +20,7 @@ import (
 const (
 	ContextKeyUser    = "user"
 	ContextKeyUserID  = "user_id"
+	ContextKeyTenantID = "tenant_id"
 	ContextKeyToken   = "token"
 	ContextKeyTokenID = "token_id"
 	ContextKeyRole    = "role"
@@ -187,10 +188,34 @@ func GatewayAuthMiddleware(tokenService service.TokenService) gin.HandlerFunc {
 			return
 		}
 
+		// 租户隔离校验：请求租户必须与 Token 绑定租户一致
+		requestTenantID := strings.TrimSpace(c.GetHeader("X-Tenant-ID"))
+		effectiveTenantID := tokenInfo.EffectiveTenantID()
+		if effectiveTenantID == "" {
+			c.JSON(http.StatusUnauthorized, model.NewOpenAIError(
+				"租户信息缺失",
+				model.OpenAIErrorTypeAuthentication,
+				nil,
+			))
+			c.Abort()
+			return
+		}
+		if requestTenantID != "" && requestTenantID != effectiveTenantID {
+			c.JSON(http.StatusForbidden, model.NewOpenAIError(
+				"租户隔离校验失败",
+				model.OpenAIErrorTypePermission,
+				nil,
+			))
+			c.Abort()
+			return
+		}
+
 		// 设置上下文
 		c.Set(ContextKeyToken, tokenInfo)
 		c.Set(ContextKeyTokenID, tokenInfo.ID)
 		c.Set(ContextKeyUserID, tokenInfo.UserID)
+		c.Set(ContextKeyTenantID, effectiveTenantID)
+		c.Header("X-Tenant-ID", effectiveTenantID)
 
 		// 更新最后使用时间（使用 Redis 进行节流：每个 Token 每分钟最多写一次 DB）
 		lastUsedKey := "token:last_used:" + tokenInfo.ID.String()
@@ -220,6 +245,23 @@ func GetCurrentUserID(c *gin.Context) (uuid.UUID, bool) {
 		return uuid.Nil, false
 	}
 	return userID.(uuid.UUID), true
+}
+
+// GetCurrentTenantID 从上下文获取当前租户 ID
+func GetCurrentTenantID(c *gin.Context) (string, bool) {
+	tenantID, exists := c.Get(ContextKeyTenantID)
+	if !exists {
+		return "", false
+	}
+	value, ok := tenantID.(string)
+	if !ok {
+		return "", false
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	return value, true
 }
 
 // GetCurrentToken 从上下文获取当前 Token
