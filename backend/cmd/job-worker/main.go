@@ -82,6 +82,11 @@ func main() {
 	routeResolver := scheduler.NewRouteResolver(modelRouteRepo)
 	capabilityMatcher := scheduler.NewCapabilityMatcher(providerCapabilityRepo)
 	sourceAdapterRegistry := scheduler.NewSourceAdapterRegistry(
+		scheduler.NewWebSocketTransportAdapter(),
+		scheduler.NewGRPCTransportAdapter(),
+		scheduler.NewAzureOpenAIAdapter(),
+		scheduler.NewAnthropicAdapter(),
+		scheduler.NewGoogleAdapter(),
 		scheduler.NewOpenAICompatibleAdapter(),
 	)
 	providerRateLimiter := scheduler.NewProviderRateLimiter(rateLimitRuleRepo, nil)

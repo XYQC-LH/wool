@@ -62,6 +62,11 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	routeResolver := scheduler.NewRouteResolver(modelRouteRepo)
 	capabilityMatcher := scheduler.NewCapabilityMatcher(providerCapabilityRepo)
 	sourceAdapterRegistry := scheduler.NewSourceAdapterRegistry(
+		scheduler.NewWebSocketTransportAdapter(),
+		scheduler.NewGRPCTransportAdapter(),
+		scheduler.NewAzureOpenAIAdapter(),
+		scheduler.NewAnthropicAdapter(),
+		scheduler.NewGoogleAdapter(),
 		scheduler.NewOpenAICompatibleAdapter(),
 	)
 	providerRateLimiter := scheduler.NewProviderRateLimiter(providerRateLimitRuleRepo, nil)
@@ -202,6 +207,8 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		v1.Use(middleware.GatewayRateLimitMiddleware(cfg.RateLimit))
 
 		v1.POST("/chat/completions", gatewayHandler.ChatCompletions)
+		v1.GET("/ws/chat/completions", gatewayHandler.ChatCompletionsWebSocket)
+		v1.POST("/grpc/gateway", gatewayHandler.GRPCGateway)
 		v1.POST("/completions", gatewayHandler.Completions)
 		v1.POST("/embeddings", gatewayHandler.Embeddings)
 		v1.GET("/models", gatewayHandler.ListModels)

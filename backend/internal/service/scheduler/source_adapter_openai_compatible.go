@@ -31,7 +31,7 @@ func (a *openAICompatibleAdapter) Match(operation string, provider *model.ModelP
 	if model.NormalizeOperation(operation) == "" {
 		return false
 	}
-	return true
+	return ResolveProviderProtocol(provider) == SourceProtocolOpenAICompatible
 }
 
 func (a *openAICompatibleAdapter) Execute(ctx context.Context, request *AdapterRequest) (interface{}, error) {
@@ -42,6 +42,18 @@ func (a *openAICompatibleAdapter) Execute(ctx context.Context, request *AdapterR
 		return nil, fmt.Errorf("adapter executor 不能为空")
 	}
 
-	// 骨架阶段：先透传到既有执行器，后续在此处替换为统一上游协议调用。
-	return request.Executor(ctx, request.Provider)
+	execCtx := WithSourceTransport(ctx, ResolveProviderTransport(request.Provider))
+	return request.Executor(execCtx, request.Provider)
+}
+
+func (a *openAICompatibleAdapter) ExecuteStream(ctx context.Context, request *AdapterStreamRequest) error {
+	if request == nil || request.Provider == nil {
+		return fmt.Errorf("adapter stream request 无效")
+	}
+	if request.Executor == nil {
+		return fmt.Errorf("adapter stream executor 不能为空")
+	}
+
+	execCtx := WithSourceTransport(ctx, ResolveProviderTransport(request.Provider))
+	return request.Executor(execCtx, request.Provider, request.OnFirstChunk)
 }

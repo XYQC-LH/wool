@@ -223,6 +223,8 @@ npm run dev
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/v1/chat/completions` | POST | 聊天补全 |
+| `/v1/ws/chat/completions` | GET (WebSocket) | WebSocket 长连接聊天补全（首帧发送请求体） |
+| `/v1/grpc/gateway` | POST | gRPC Gateway 兼容入口（method + payload） |
 | `/v1/completions` | POST | 文本补全 |
 | `/v1/embeddings` | POST | 文本嵌入 |
 | `/v1/models` | GET | 获取可用模型列表 |

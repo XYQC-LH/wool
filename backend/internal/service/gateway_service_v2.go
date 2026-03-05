@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
+	"golang.org/x/net/websocket"
 )
 
 // gatewayServiceV2 增强版 Gateway 服务实现
@@ -215,6 +217,10 @@ func (s *gatewayServiceV2) executeProviderRequest(ctx context.Context, provider 
 		return nil, fmt.Errorf("源头缺少渠道信息")
 	}
 
+	if scheduler.SourceTransportFromContext(ctx) == scheduler.SourceTransportWebSocket {
+		return s.executeProviderRequestByWebSocket(ctx, provider, req)
+	}
+
 	upstreamReq, err := s.buildProviderRequest(ctx, provider, req)
 	if err != nil {
 		return nil, fmt.Errorf("构建请求失败: %w", err)
@@ -258,7 +264,22 @@ func (s *gatewayServiceV2) buildProviderRequest(ctx context.Context, provider *m
 		return nil, err
 	}
 
-	upstreamURL, err := buildOpenAIURL(provider.Channel.BaseURL, "/chat/completions")
+	transport := scheduler.SourceTransportFromContext(ctx)
+	endpoint := "/chat/completions"
+	contentType := "application/json"
+	switch transport {
+	case scheduler.SourceTransportGRPC:
+		if configured := strings.TrimSpace(readProviderChannelConfigString(provider, "grpc_gateway_path", "grpc_path")); configured != "" {
+			endpoint = configured
+		}
+		contentType = "application/grpc+json"
+	default:
+		if configured := strings.TrimSpace(readProviderChannelConfigString(provider, "http_path")); configured != "" {
+			endpoint = configured
+		}
+	}
+
+	upstreamURL, err := buildOpenAIURL(provider.Channel.BaseURL, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -268,10 +289,47 @@ func (s *gatewayServiceV2) buildProviderRequest(ctx context.Context, provider *m
 		return nil, err
 	}
 
-	upstreamReq.Header.Set("Content-Type", "application/json")
+	upstreamReq.Header.Set("Content-Type", contentType)
 	upstreamReq.Header.Set("Authorization", "Bearer "+provider.Channel.APIKey)
+	upstreamReq.Header.Set("X-Source-Transport", string(transport))
 
 	return upstreamReq, nil
+}
+
+func (s *gatewayServiceV2) executeProviderRequestByWebSocket(ctx context.Context, provider *model.ModelProvider, req *ChatCompletionRequest) (*ChatCompletionResponse, error) {
+	if provider == nil || provider.Channel == nil {
+		return nil, fmt.Errorf("源头缺少渠道信息")
+	}
+
+	upstreamModel := provider.UpstreamModelName
+	if upstreamModel == "" {
+		upstreamModel = req.Model
+	}
+
+	reqCopy := *req
+	reqCopy.Stream = false
+	reqCopy.Model = upstreamModel
+
+	wsURL, err := s.resolveProviderWebSocketURL(provider, "/chat/completions")
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := dialProviderWebSocket(ctx, wsURL, provider.Channel.APIKey)
+	if err != nil {
+		return nil, fmt.Errorf("建立 WebSocket 上游连接失败: %w", err)
+	}
+	defer conn.Close()
+
+	if err := websocket.JSON.Send(conn, reqCopy); err != nil {
+		return nil, fmt.Errorf("发送 WebSocket 请求失败: %w", err)
+	}
+
+	var response ChatCompletionResponse
+	if err := websocket.JSON.Receive(conn, &response); err != nil {
+		return nil, fmt.Errorf("读取 WebSocket 响应失败: %w", err)
+	}
+	return &response, nil
 }
 
 // calculateProviderCost 已移除，使用costCalculator.CalculateProviderCost替代
@@ -380,43 +438,7 @@ func (s *gatewayServiceV2) HandleCompletion(req *CompletionRequest, token *model
 	}
 
 	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
-		if execCtx == nil {
-			execCtx = context.Background()
-		}
-		if provider == nil || provider.Channel == nil {
-			return nil, fmt.Errorf("源头缺少 channel 信息")
-		}
-
-		reqBody, _ := json.Marshal(req)
-		upstreamURL, err := buildOpenAIURL(provider.Channel.BaseURL, "/completions")
-		if err != nil {
-			return nil, err
-		}
-
-		upstreamReq, err := http.NewRequestWithContext(execCtx, http.MethodPost, upstreamURL, bytes.NewReader(reqBody))
-		if err != nil {
-			return nil, err
-		}
-		upstreamReq.Header.Set("Content-Type", "application/json")
-		upstreamReq.Header.Set("Authorization", "Bearer "+provider.Channel.APIKey)
-
-		resp, err := s.httpClient.Do(upstreamReq)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			bodyStr := strings.TrimSpace(string(body))
-			return nil, NewUpstreamHTTPError(resp.StatusCode, bodyStr)
-		}
-
-		var completionResp CompletionResponse
-		if err := json.NewDecoder(resp.Body).Decode(&completionResp); err != nil {
-			return nil, err
-		}
-		return &completionResp, nil
+		return s.executeCompletionProviderRequest(execCtx, provider, req)
 	}
 
 	operation := model.OperationCompletions
@@ -486,43 +508,7 @@ func (s *gatewayServiceV2) HandleEmbedding(req *EmbeddingRequest, token *model.T
 	}
 
 	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
-		if execCtx == nil {
-			execCtx = context.Background()
-		}
-		if provider == nil || provider.Channel == nil {
-			return nil, fmt.Errorf("源头缺少 channel 信息")
-		}
-
-		reqBody, _ := json.Marshal(req)
-		upstreamURL, err := buildOpenAIURL(provider.Channel.BaseURL, "/embeddings")
-		if err != nil {
-			return nil, err
-		}
-
-		upstreamReq, err := http.NewRequestWithContext(execCtx, http.MethodPost, upstreamURL, bytes.NewReader(reqBody))
-		if err != nil {
-			return nil, err
-		}
-		upstreamReq.Header.Set("Content-Type", "application/json")
-		upstreamReq.Header.Set("Authorization", "Bearer "+provider.Channel.APIKey)
-
-		resp, err := s.httpClient.Do(upstreamReq)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			bodyStr := strings.TrimSpace(string(body))
-			return nil, NewUpstreamHTTPError(resp.StatusCode, bodyStr)
-		}
-
-		var embeddingResp EmbeddingResponse
-		if err := json.NewDecoder(resp.Body).Decode(&embeddingResp); err != nil {
-			return nil, err
-		}
-		return &embeddingResp, nil
+		return s.executeEmbeddingProviderRequest(execCtx, provider, req)
 	}
 
 	operation := model.OperationEmbeddings
@@ -625,6 +611,10 @@ func convertMessages(messages []ChatMessage) []map[string]interface{} {
 
 // executeStreamRequest 执行流式请求
 func (s *gatewayServiceV2) executeStreamRequest(ctx context.Context, provider *model.ModelProvider, req *ChatCompletionRequest, writer http.ResponseWriter, onFirstChunk func()) error {
+	if scheduler.SourceTransportFromContext(ctx) == scheduler.SourceTransportWebSocket {
+		return s.executeStreamRequestByWebSocket(ctx, provider, req, writer, onFirstChunk)
+	}
+
 	upstreamReq, err := s.buildProviderRequest(ctx, provider, req)
 	if err != nil {
 		return fmt.Errorf("构建请求失败: %w", err)
@@ -679,6 +669,277 @@ func (s *gatewayServiceV2) executeStreamRequest(ctx context.Context, provider *m
 	}
 
 	return nil
+}
+
+func (s *gatewayServiceV2) executeStreamRequestByWebSocket(ctx context.Context, provider *model.ModelProvider, req *ChatCompletionRequest, writer http.ResponseWriter, onFirstChunk func()) error {
+	if provider == nil || provider.Channel == nil {
+		return fmt.Errorf("源头缺少渠道信息")
+	}
+
+	upstreamModel := provider.UpstreamModelName
+	if upstreamModel == "" {
+		upstreamModel = req.Model
+	}
+	reqCopy := *req
+	reqCopy.Stream = true
+	reqCopy.Model = upstreamModel
+
+	wsURL, err := s.resolveProviderWebSocketURL(provider, "/chat/completions")
+	if err != nil {
+		return err
+	}
+
+	conn, err := dialProviderWebSocket(ctx, wsURL, provider.Channel.APIKey)
+	if err != nil {
+		return fmt.Errorf("建立 WebSocket 上游连接失败: %w", err)
+	}
+	defer conn.Close()
+
+	if err := websocket.JSON.Send(conn, reqCopy); err != nil {
+		return fmt.Errorf("发送 WebSocket 请求失败: %w", err)
+	}
+
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		return errors.New("streaming not supported")
+	}
+
+	firstDataFlushed := false
+	for {
+		var chunk string
+		if err := websocket.Message.Receive(conn, &chunk); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+
+		if !firstDataFlushed && onFirstChunk != nil {
+			onFirstChunk()
+			firstDataFlushed = true
+		}
+
+		output := strings.TrimSpace(chunk)
+		if output == "" {
+			continue
+		}
+
+		if output == "[DONE]" {
+			output = "data: [DONE]"
+		} else if !strings.HasPrefix(output, "data:") {
+			output = "data: " + output
+		}
+
+		if !strings.HasSuffix(output, "\n\n") {
+			output += "\n\n"
+		}
+
+		if _, err := writer.Write([]byte(output)); err != nil {
+			return err
+		}
+		flusher.Flush()
+
+		if strings.Contains(output, "data: [DONE]") {
+			break
+		}
+	}
+
+	return nil
+}
+
+func (s *gatewayServiceV2) executeCompletionProviderRequest(execCtx context.Context, provider *model.ModelProvider, req *CompletionRequest) (*CompletionResponse, error) {
+	if execCtx == nil {
+		execCtx = context.Background()
+	}
+	if provider == nil || provider.Channel == nil {
+		return nil, fmt.Errorf("源头缺少 channel 信息")
+	}
+
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := "/completions"
+	contentType := "application/json"
+	if scheduler.SourceTransportFromContext(execCtx) == scheduler.SourceTransportGRPC {
+		if configured := strings.TrimSpace(readProviderChannelConfigString(provider, "grpc_gateway_path", "grpc_path")); configured != "" {
+			endpoint = configured
+		}
+		contentType = "application/grpc+json"
+	}
+
+	upstreamURL, err := buildOpenAIURL(provider.Channel.BaseURL, endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(execCtx, http.MethodPost, upstreamURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	upstreamReq.Header.Set("Content-Type", contentType)
+	upstreamReq.Header.Set("Authorization", "Bearer "+provider.Channel.APIKey)
+	upstreamReq.Header.Set("X-Source-Transport", string(scheduler.SourceTransportFromContext(execCtx)))
+
+	resp, err := s.httpClient.Do(upstreamReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := strings.TrimSpace(string(body))
+		return nil, NewUpstreamHTTPError(resp.StatusCode, bodyStr)
+	}
+
+	var completionResp CompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&completionResp); err != nil {
+		return nil, err
+	}
+	return &completionResp, nil
+}
+
+func (s *gatewayServiceV2) executeEmbeddingProviderRequest(execCtx context.Context, provider *model.ModelProvider, req *EmbeddingRequest) (*EmbeddingResponse, error) {
+	if execCtx == nil {
+		execCtx = context.Background()
+	}
+	if provider == nil || provider.Channel == nil {
+		return nil, fmt.Errorf("源头缺少 channel 信息")
+	}
+
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := "/embeddings"
+	contentType := "application/json"
+	if scheduler.SourceTransportFromContext(execCtx) == scheduler.SourceTransportGRPC {
+		if configured := strings.TrimSpace(readProviderChannelConfigString(provider, "grpc_gateway_path", "grpc_path")); configured != "" {
+			endpoint = configured
+		}
+		contentType = "application/grpc+json"
+	}
+
+	upstreamURL, err := buildOpenAIURL(provider.Channel.BaseURL, endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(execCtx, http.MethodPost, upstreamURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	upstreamReq.Header.Set("Content-Type", contentType)
+	upstreamReq.Header.Set("Authorization", "Bearer "+provider.Channel.APIKey)
+	upstreamReq.Header.Set("X-Source-Transport", string(scheduler.SourceTransportFromContext(execCtx)))
+
+	resp, err := s.httpClient.Do(upstreamReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := strings.TrimSpace(string(body))
+		return nil, NewUpstreamHTTPError(resp.StatusCode, bodyStr)
+	}
+
+	var embeddingResp EmbeddingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&embeddingResp); err != nil {
+		return nil, err
+	}
+	return &embeddingResp, nil
+}
+
+func (s *gatewayServiceV2) resolveProviderWebSocketURL(provider *model.ModelProvider, endpoint string) (string, error) {
+	if provider == nil || provider.Channel == nil {
+		return "", fmt.Errorf("源头缺少渠道信息")
+	}
+
+	wsEndpoint := strings.TrimSpace(readProviderChannelConfigString(provider, "websocket_path", "ws_path"))
+	if wsEndpoint == "" {
+		wsEndpoint = endpoint
+	}
+
+	httpURL, err := buildOpenAIURL(provider.Channel.BaseURL, wsEndpoint)
+	if err != nil {
+		return "", err
+	}
+
+	parsed, err := url.Parse(httpURL)
+	if err != nil {
+		return "", err
+	}
+
+	switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
+	case "https", "wss":
+		parsed.Scheme = "wss"
+	case "http", "ws":
+		parsed.Scheme = "ws"
+	default:
+		parsed.Scheme = "wss"
+	}
+
+	return parsed.String(), nil
+}
+
+func dialProviderWebSocket(ctx context.Context, rawURL string, apiKey string) (*websocket.Conn, error) {
+	config, err := websocket.NewConfig(rawURL, "https://nexus-api.local")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(apiKey) != "" {
+		config.Header = http.Header{}
+		config.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	conn, err := websocket.DialConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	if ctx != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = conn.SetDeadline(deadline)
+		}
+		conn.PayloadType = websocket.TextFrame
+	}
+
+	return conn, nil
+}
+
+func readProviderChannelConfigString(provider *model.ModelProvider, keys ...string) string {
+	if provider == nil || provider.Channel == nil || provider.Channel.Config == nil || len(keys) == 0 {
+		return ""
+	}
+
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		raw, ok := provider.Channel.Config[key]
+		if !ok || raw == nil {
+			continue
+		}
+		value, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // logProviderRequest 记录Provider请求日志

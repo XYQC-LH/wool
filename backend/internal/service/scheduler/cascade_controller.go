@@ -1334,10 +1334,21 @@ func (c *cascadeController) executeStreamViaAdapter(ctx context.Context, operati
 		return fmt.Errorf("StreamExecutor 不能为空")
 	}
 
-	// 预留 SourceAdapter 的流式扩展点：
-	// 当前仍透传至既有 StreamExecutor，后续在这里接入统一流式协议适配。
-	_ = operation
-	return executor(ctx, provider, onFirstChunk)
+	if c == nil || c.sourceAdapterRegistry == nil {
+		return executor(ctx, provider, onFirstChunk)
+	}
+
+	adapter := c.sourceAdapterRegistry.Resolve(operation, provider)
+	if adapter == nil {
+		return executor(ctx, provider, onFirstChunk)
+	}
+
+	return adapter.ExecuteStream(ctx, &AdapterStreamRequest{
+		Operation:    operation,
+		Provider:     provider,
+		Executor:     executor,
+		OnFirstChunk: onFirstChunk,
+	})
 }
 
 // attachSelectedInstance 涓?provider 閫夋嫨骞剁粦瀹氬疄渚嬶紝骞剁‘淇濇墽琛岀粨鏉熷悗閲婃斁骞跺彂妲戒綅
