@@ -34,6 +34,8 @@ const (
 	AlertTypeLowBalance       AlertType = "low_balance"
 	AlertTypeHighLatency      AlertType = "high_latency"
 	AlertTypeSystemError      AlertType = "system_error"
+	AlertTypeQuotaWarning     AlertType = "quota_warning"
+	AlertTypeQuotaExceeded    AlertType = "quota_exceeded"
 )
 
 // Alert 告警模型

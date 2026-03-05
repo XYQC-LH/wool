@@ -46,6 +46,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	providerPricingRuleRepo := repository.NewProviderPricingRuleRepository(db)
 	providerRateLimitRuleRepo := repository.NewProviderRateLimitRuleRepository(db)
 	dispatchAttemptRepo := repository.NewDispatchAttemptRepository(db)
+	quotaPolicyRepo := repository.NewQuotaPolicyRepository(db)
 
 	// ==================== Infra ====================
 	objStore, err := storage.NewObjectStorage(cfg.OSS)
@@ -100,6 +101,8 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	logService := service.NewLogService(logRepo)
 	modelService := service.NewModelService(modelRepo)
 	alertService := service.NewAlertService(alertRepo)
+	quotaService := service.NewQuotaService(quotaPolicyRepo, alertService)
+	billingService := service.NewBillingService(db)
 	settingsService := service.NewSettingsService(systemSettingRepo)
 	tenantBillingHook := service.NewTenantBillingHook(cfg.RateLimit)
 
@@ -160,6 +163,8 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	providerPricingRuleHandler := handler.NewProviderPricingRuleHandler(providerPricingRuleRepo)
 	providerRateLimitRuleHandler := handler.NewProviderRateLimitRuleHandler(providerRateLimitRuleRepo)
 	adminTokenHandler := handler.NewAdminTokenHandler(adminTokenService)
+	adminQuotaHandler := handler.NewAdminQuotaHandler(quotaService)
+	adminBillingHandler := handler.NewAdminBillingHandler(billingService)
 
 	// ==================== Router ====================
 	if cfg.Server.Mode == "release" {
@@ -339,6 +344,8 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		handler.RegisterTopologyRoutes(adminAPI, db)
 		handler.RegisterDispatchRoutes(adminAPI, db)
 		handler.RegisterFinanceRoutes(adminAPI, db)
+		adminQuotaHandler.RegisterRoutes(adminAPI)
+		adminBillingHandler.RegisterRoutes(adminAPI)
 	}
 
 	return r, nil

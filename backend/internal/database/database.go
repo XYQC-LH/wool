@@ -113,6 +113,7 @@ func AutoMigrate() error {
 		&model.Announcement{},
 		&model.GenerationTask{},
 		&model.Alert{},
+		&model.QuotaPolicy{},
 
 		// 系统设置（按 section 存储）
 		&model.SystemSetting{},
