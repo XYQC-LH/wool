@@ -106,6 +106,7 @@ func AutoMigrate() error {
 
 		// 日志和订单
 		&model.Log{},
+		&model.AuditLog{},
 		&model.Order{},
 
 		// 其他

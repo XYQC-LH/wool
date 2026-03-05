@@ -27,6 +27,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	channelRepo := repository.NewChannelRepository(db)
 	modelRepo := repository.NewModelRepository(db)
 	logRepo := repository.NewLogRepository(db)
+	auditLogRepo := repository.NewAuditLogRepository(db)
 	orderRepo := repository.NewOrderRepository(db)
 	resourceAccountRepo := repository.NewResourceAccountRepository(db)
 	announcementRepo := repository.NewAnnouncementRepository(db)
@@ -99,10 +100,12 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	audioService := service.NewAudioService(userRepo, tokenService, modelRepo, providerPricingRuleRepo, logRepo, providerInstanceRepo, healthTracker, cascadeController)
 	orderService := service.NewOrderService(orderRepo, userRepo)
 	logService := service.NewLogService(logRepo)
+	auditLogService := service.NewAuditLogService(auditLogRepo)
 	modelService := service.NewModelService(modelRepo)
 	alertService := service.NewAlertService(alertRepo)
 	quotaService := service.NewQuotaService(quotaPolicyRepo, alertService)
 	billingService := service.NewBillingService(db)
+	metricsService := service.NewMetricsService(db)
 	settingsService := service.NewSettingsService(systemSettingRepo)
 	tenantBillingHook := service.NewTenantBillingHook(cfg.RateLimit)
 
@@ -148,6 +151,8 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	userHandler := handler.NewUserHandler(userService, tokenService, orderService, logService, modelService, announcementService)
 	gatewayHandler := handler.NewGatewayHandler(gatewayService)
 	adminHandler := handler.NewAdminHandler(userService, channelService, orderService, logService, modelService, resourceAccountRepo, announcementRepo, settingsService, alertService)
+	adminLogHandler := handler.NewAdminLogHandler(logService, auditLogService)
+	adminMetricsHandler := handler.NewAdminMetricsHandler(metricsService, alertService)
 	alertHandler := handler.NewAlertHandler(alertService)
 	assetHandler := handler.NewAssetHandler(assetService)
 	objectHandler := handler.NewObjectHandler(cfg.OSS.LocalDir, cfg.OSS.SignSecret)
@@ -264,6 +269,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	adminAPI := r.Group("/api/admin")
 	adminAPI.Use(middleware.JWTAuthMiddleware(cfg.JWT.Secret))
 	adminAPI.Use(middleware.AdminOnlyMiddleware())
+	adminAPI.Use(middleware.AdminAuditMiddleware(auditLogService))
 	{
 		adminAPI.GET("/dashboard", adminHandler.GetDashboard)
 		adminAPI.GET("/dashboard/system", adminHandler.GetSystemMonitor)
@@ -296,8 +302,8 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		adminAPI.PUT("/users/:id/status", adminHandler.UpdateUserStatus)
 		adminAPI.PUT("/users/:id/balance", adminHandler.UpdateUserBalance)
 
-		adminAPI.GET("/logs", adminHandler.ListLogs)
-		adminAPI.GET("/logs/stats", adminHandler.GetLogStats)
+		adminLogHandler.RegisterRoutes(adminAPI)
+		adminMetricsHandler.RegisterRoutes(adminAPI)
 
 		adminAPI.GET("/orders", adminHandler.ListOrders)
 		handler.RegisterOrderStatsRoutes(adminAPI, db)
