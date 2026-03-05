@@ -5,17 +5,27 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"strings"
 	"time"
 
 	"nexus-api/internal/cache"
+	"nexus-api/internal/observability"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
+const (
+	ContextKeyRequestID = "request_id"
+	ContextKeyTraceID   = "trace_id"
+	ContextKeySpanID    = "span_id"
+)
+
 // LogEntry 日志条目
 type LogEntry struct {
 	RequestID    string        `json:"request_id"`
+	TraceID      string        `json:"trace_id,omitempty"`
+	SpanID       string        `json:"span_id,omitempty"`
 	Timestamp    time.Time     `json:"timestamp"`
 	Method       string        `json:"method"`
 	Path         string        `json:"path"`
@@ -55,10 +65,28 @@ func (w *responseWriter) WriteString(s string) (int, error) {
 // LoggerMiddleware 日志中间件
 func LoggerMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 生成请求 ID
-		requestID := uuid.New().String()
-		c.Set("request_id", requestID)
+		requestID := strings.TrimSpace(c.GetHeader("X-Request-ID"))
+		if requestID == "" {
+			requestID = uuid.New().String()
+		}
+		c.Set(ContextKeyRequestID, requestID)
 		c.Header("X-Request-ID", requestID)
+
+		traceSeed := strings.ReplaceAll(requestID, "-", "")
+		traceID, parentSpanID := observability.ExtractOrCreateTrace(c.Request.Header, traceSeed)
+		routePath := c.FullPath()
+		if strings.TrimSpace(routePath) == "" {
+			routePath = c.Request.URL.Path
+		}
+		traceCtx := observability.ContextWithTrace(c.Request.Context(), traceID, parentSpanID)
+		spanCtx, requestSpan := observability.StartSpan(traceCtx, "http.server", observability.SpanKindServer, map[string]string{
+			"method": c.Request.Method,
+			"path":   routePath,
+		})
+		c.Request = c.Request.WithContext(spanCtx)
+		c.Set(ContextKeyTraceID, traceID)
+		c.Set(ContextKeySpanID, requestSpan.SpanID)
+		observability.InjectTraceHeaders(c.Writer.Header(), traceID, requestSpan.SpanID, parentSpanID)
 
 		// 记录开始时间
 		startTime := time.Now()
@@ -95,10 +123,17 @@ func LoggerMiddleware() gin.HandlerFunc {
 		if len(c.Errors) > 0 {
 			errorMsg = c.Errors.String()
 		}
+		var spanErr error
+		if errorMsg != "" {
+			spanErr = c.Errors.Last()
+		}
+		requestSpan.End(spanErr)
 
 		// 创建日志条目
 		entry := &LogEntry{
 			RequestID:    requestID,
+			TraceID:      traceID,
+			SpanID:       requestSpan.SpanID,
 			Timestamp:    startTime,
 			Method:       c.Request.Method,
 			Path:         c.Request.URL.Path,
@@ -113,6 +148,17 @@ func LoggerMiddleware() gin.HandlerFunc {
 			ResponseSize: blw.size,
 			Error:        errorMsg,
 		}
+
+		observability.RecordHTTPRequest(observability.HTTPRequestRecord{
+			Timestamp:   startTime,
+			TraceID:     traceID,
+			Method:      c.Request.Method,
+			Path:        c.Request.URL.Path,
+			StatusCode:  c.Writer.Status(),
+			LatencyMs:   latency.Milliseconds(),
+			RequestSize: requestSize,
+			Error:       errorMsg,
+		})
 
 		// 异步记录日志
 		go logAsync(entry)
@@ -142,8 +188,9 @@ func logToConsole(entry *LogEntry) {
 	statusColor := getStatusColor(entry.StatusCode)
 	methodColor := getMethodColor(entry.Method)
 
-	log.Printf("[%s] %s%s\033[0m %s%d\033[0m %s %dms %s",
-		entry.RequestID[:8],
+	log.Printf("[%s][%s] %s%s\033[0m %s%d\033[0m %s %dms %s",
+		shortTrace(entry.TraceID),
+		shortID(entry.RequestID),
 		methodColor, entry.Method,
 		statusColor, entry.StatusCode,
 		entry.Path,
@@ -187,10 +234,28 @@ func getMethodColor(method string) string {
 // GatewayLoggerMiddleware Gateway API 专用日志中间件
 func GatewayLoggerMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 生成请求 ID
-		requestID := uuid.New().String()
-		c.Set("request_id", requestID)
+		requestID := strings.TrimSpace(c.GetHeader("X-Request-ID"))
+		if requestID == "" {
+			requestID = uuid.New().String()
+		}
+		c.Set(ContextKeyRequestID, requestID)
 		c.Header("X-Request-ID", requestID)
+
+		traceSeed := strings.ReplaceAll(requestID, "-", "")
+		traceID, parentSpanID := observability.ExtractOrCreateTrace(c.Request.Header, traceSeed)
+		routePath := c.FullPath()
+		if strings.TrimSpace(routePath) == "" {
+			routePath = c.Request.URL.Path
+		}
+		traceCtx := observability.ContextWithTrace(c.Request.Context(), traceID, parentSpanID)
+		spanCtx, requestSpan := observability.StartSpan(traceCtx, "http.server", observability.SpanKindServer, map[string]string{
+			"method": c.Request.Method,
+			"path":   routePath,
+		})
+		c.Request = c.Request.WithContext(spanCtx)
+		c.Set(ContextKeyTraceID, traceID)
+		c.Set(ContextKeySpanID, requestSpan.SpanID)
+		observability.InjectTraceHeaders(c.Writer.Header(), traceID, requestSpan.SpanID, parentSpanID)
 
 		// 记录开始时间
 		startTime := time.Now()
@@ -214,6 +279,11 @@ func GatewayLoggerMiddleware() gin.HandlerFunc {
 
 		// 计算延迟
 		latency := time.Since(startTime)
+		var spanErr error
+		if len(c.Errors) > 0 {
+			spanErr = c.Errors.Last()
+		}
+		requestSpan.End(spanErr)
 
 		// 获取用户和 Token 信息
 		var userID, tokenKey string
@@ -227,6 +297,8 @@ func GatewayLoggerMiddleware() gin.HandlerFunc {
 		// 创建 Gateway 日志条目
 		gatewayLog := &GatewayLogEntry{
 			RequestID:    requestID,
+			TraceID:      traceID,
+			SpanID:       requestSpan.SpanID,
 			Timestamp:    startTime,
 			Method:       c.Request.Method,
 			Path:         c.Request.URL.Path,
@@ -264,6 +336,21 @@ func GatewayLoggerMiddleware() gin.HandlerFunc {
 			gatewayLog.ChannelID = channelID.(uint)
 		}
 
+		var errorMsg string
+		if len(c.Errors) > 0 {
+			errorMsg = c.Errors.String()
+		}
+		observability.RecordHTTPRequest(observability.HTTPRequestRecord{
+			Timestamp:   startTime,
+			TraceID:     traceID,
+			Method:      c.Request.Method,
+			Path:        c.Request.URL.Path,
+			StatusCode:  c.Writer.Status(),
+			LatencyMs:   latency.Milliseconds(),
+			RequestSize: len(requestBody),
+			Error:       errorMsg,
+		})
+
 		// 异步记录 Gateway 日志
 		go logGatewayAsync(gatewayLog)
 
@@ -275,6 +362,8 @@ func GatewayLoggerMiddleware() gin.HandlerFunc {
 // GatewayLogEntry Gateway 日志条目
 type GatewayLogEntry struct {
 	RequestID        string        `json:"request_id"`
+	TraceID          string        `json:"trace_id,omitempty"`
+	SpanID           string        `json:"span_id,omitempty"`
 	Timestamp        time.Time     `json:"timestamp"`
 	Method           string        `json:"method"`
 	Path             string        `json:"path"`
@@ -316,8 +405,9 @@ func logGatewayAsync(entry *GatewayLogEntry) {
 func logGatewayToConsole(entry *GatewayLogEntry) {
 	statusColor := getStatusColor(entry.StatusCode)
 
-	log.Printf("[Gateway] [%s] %s%d\033[0m %s model=%s tokens=%d/%d %dms",
-		entry.RequestID[:8],
+	log.Printf("[Gateway][%s][%s] %s%d\033[0m %s model=%s tokens=%d/%d %dms",
+		shortTrace(entry.TraceID),
+		shortID(entry.RequestID),
 		statusColor, entry.StatusCode,
 		entry.Path,
 		entry.Model,
@@ -325,6 +415,22 @@ func logGatewayToConsole(entry *GatewayLogEntry) {
 		entry.CompletionTokens,
 		entry.LatencyMs,
 	)
+}
+
+func shortID(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) <= 8 {
+		return trimmed
+	}
+	return trimmed[:8]
+}
+
+func shortTrace(value string) string {
+	normalized := strings.ReplaceAll(strings.TrimSpace(value), "-", "")
+	if len(normalized) < 8 {
+		return shortID(normalized)
+	}
+	return normalized[:8]
 }
 
 // maskTokenKey 遮蔽 Token Key

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"nexus-api/internal/model"
+	"nexus-api/internal/observability"
 	"nexus-api/internal/repository"
 	"nexus-api/internal/service/scheduler"
 
@@ -79,7 +80,7 @@ func NewGatewayServiceV2(
 		modelRepo:         modelRepo,
 		resourceRepo:      resourceRepo,
 		channelRepo:       channelRepo,
-		httpClient:        &http.Client{Timeout: 5 * time.Minute},
+		httpClient:        observability.NewHTTPClient(5 * time.Minute),
 		providerRepo:      providerRepo,
 		instanceRepo:      instanceRepo,
 		providerSelector:  providerSelector,
@@ -98,7 +99,7 @@ func NewGatewayServiceV2(
 // HandleChatCompletion 处理聊天完成请求
 func (s *gatewayServiceV2) HandleChatCompletion(req *ChatCompletionRequest, token *model.Token) (*ChatCompletionResponse, error) {
 	startTime := time.Now()
-	ctx := context.Background()
+	ctx := requestContextOrBackground(req.RequestContext)
 
 	modelPricing, err := s.modelRepo.GetPricing(req.Model)
 	if err != nil {
@@ -363,7 +364,7 @@ func (s *gatewayServiceV2) executeProviderRequestByWebSocket(ctx context.Context
 // HandleChatCompletionStream 处理流式聊天完成请求
 func (s *gatewayServiceV2) HandleChatCompletionStream(req *ChatCompletionRequest, token *model.Token, writer http.ResponseWriter) error {
 	startTime := time.Now()
-	ctx := context.Background()
+	ctx := requestContextOrBackground(req.RequestContext)
 
 	modelPricing, err := s.modelRepo.GetPricing(req.Model)
 	if err != nil {
@@ -462,7 +463,7 @@ func (s *gatewayServiceV2) handleStreamWithScheduler(ctx context.Context, req *C
 // HandleCompletion 处理完成请求
 func (s *gatewayServiceV2) HandleCompletion(req *CompletionRequest, token *model.Token) (*CompletionResponse, error) {
 	startTime := time.Now()
-	ctx := context.Background()
+	ctx := requestContextOrBackground(req.RequestContext)
 	estimatedPromptTokens, estimatedCompletionTokens := estimateCompletionTokens(req)
 	estimatedCost, _ := s.costCalculator.CalculateCost(req.Model, estimatedPromptTokens, estimatedCompletionTokens)
 
@@ -551,7 +552,7 @@ func (s *gatewayServiceV2) HandleCompletion(req *CompletionRequest, token *model
 // HandleEmbedding 处理嵌入请求
 func (s *gatewayServiceV2) HandleEmbedding(req *EmbeddingRequest, token *model.Token) (*EmbeddingResponse, error) {
 	startTime := time.Now()
-	ctx := context.Background()
+	ctx := requestContextOrBackground(req.RequestContext)
 	estimatedPromptTokens := estimateEmbeddingTokens(req)
 	estimatedCost, _ := s.costCalculator.CalculateCost(req.Model, estimatedPromptTokens, 0)
 
@@ -967,10 +968,13 @@ func dialProviderWebSocket(ctx context.Context, rawURL string, apiKey string) (*
 	if err != nil {
 		return nil, err
 	}
+	config.Header = http.Header{}
 	if strings.TrimSpace(apiKey) != "" {
-		config.Header = http.Header{}
 		config.Header.Set("Authorization", "Bearer "+apiKey)
 	}
+	traceID := observability.TraceIDFromContext(ctx)
+	spanID := observability.SpanIDFromContext(ctx)
+	observability.InjectTraceHeaders(config.Header, traceID, spanID, "")
 
 	conn, err := websocket.DialConfig(config)
 	if err != nil {

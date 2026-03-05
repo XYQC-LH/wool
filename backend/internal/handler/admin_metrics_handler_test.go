@@ -39,6 +39,25 @@ type mockAlertService struct {
 	statsFn   func() (*model.AlertStats, error)
 }
 
+type mockObservabilityService struct {
+	analyzePerformanceFn func(ctx context.Context, query *service.PerformanceAnalysisQuery) (*service.PerformanceAnalysisResult, error)
+	forecastCapacityFn   func(ctx context.Context, query *service.CapacityForecastQuery) (*service.CapacityForecastResult, error)
+}
+
+func (m *mockObservabilityService) AnalyzePerformance(ctx context.Context, query *service.PerformanceAnalysisQuery) (*service.PerformanceAnalysisResult, error) {
+	if m.analyzePerformanceFn != nil {
+		return m.analyzePerformanceFn(ctx, query)
+	}
+	return &service.PerformanceAnalysisResult{}, nil
+}
+
+func (m *mockObservabilityService) ForecastCapacity(ctx context.Context, query *service.CapacityForecastQuery) (*service.CapacityForecastResult, error) {
+	if m.forecastCapacityFn != nil {
+		return m.forecastCapacityFn(ctx, query)
+	}
+	return &service.CapacityForecastResult{}, nil
+}
+
 func (m *mockAlertService) CreateAlert(alertType model.AlertType, severity model.AlertSeverity, title, message string, metadata model.JSON) error {
 	return nil
 }
@@ -166,5 +185,53 @@ func TestAdminMetricsHandlerResolveAlertInvalidID(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAdminMetricsHandlerPerformanceSuccess(t *testing.T) {
+	router := setupAdminMetricsRouter(NewAdminMetricsHandler(
+		&mockMetricsService{},
+		&mockAlertService{},
+		&mockObservabilityService{
+			analyzePerformanceFn: func(ctx context.Context, query *service.PerformanceAnalysisQuery) (*service.PerformanceAnalysisResult, error) {
+				return &service.PerformanceAnalysisResult{
+					Summary: service.PerformanceAnalysisSummary{
+						TotalRequests: 10,
+						SlowRequests:  1,
+					},
+				}, nil
+			},
+		},
+	))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/metrics/performance?window_seconds=600", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAdminMetricsHandlerCapacityForecastSuccess(t *testing.T) {
+	router := setupAdminMetricsRouter(NewAdminMetricsHandler(
+		&mockMetricsService{},
+		&mockAlertService{},
+		&mockObservabilityService{
+			forecastCapacityFn: func(ctx context.Context, query *service.CapacityForecastQuery) (*service.CapacityForecastResult, error) {
+				return &service.CapacityForecastResult{
+					LookbackHours: 24,
+					ForecastHours: 24,
+				}, nil
+			},
+		},
+	))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/metrics/capacity/forecast?lookback_hours=24&forecast_hours=24", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d, body=%s", w.Code, w.Body.String())
 	}
 }

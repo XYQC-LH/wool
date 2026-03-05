@@ -87,6 +87,7 @@ func (h *GatewayHandler) ChatCompletionsWebSocket(c *gin.Context) {
 			return
 		}
 		applyGatewayControlHeadersToChat(c, &req)
+		req.RequestContext = c.Request.Context()
 
 		if req.Stream {
 			writer := newWebSocketStreamWriter(conn)
@@ -147,6 +148,7 @@ func (h *GatewayHandler) GRPCGateway(c *gin.Context) {
 			return
 		}
 		applyGatewayControlHeadersToChat(c, &chatReq)
+		chatReq.RequestContext = c.Request.Context()
 
 		if chatReq.Stream {
 			c.Header("Content-Type", "text/event-stream")
@@ -179,6 +181,7 @@ func (h *GatewayHandler) GRPCGateway(c *gin.Context) {
 			return
 		}
 		applyGatewayControlHeadersToCompletion(c, &completionReq)
+		completionReq.RequestContext = c.Request.Context()
 
 		resp, err := h.gatewayService.HandleCompletion(&completionReq, token)
 		if err != nil {
@@ -199,6 +202,7 @@ func (h *GatewayHandler) GRPCGateway(c *gin.Context) {
 			return
 		}
 		applyGatewayControlHeadersToEmbedding(c, &embeddingReq)
+		embeddingReq.RequestContext = c.Request.Context()
 
 		resp, err := h.gatewayService.HandleEmbedding(&embeddingReq, token)
 		if err != nil {

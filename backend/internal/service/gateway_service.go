@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"nexus-api/internal/model"
+	"nexus-api/internal/observability"
 	"nexus-api/internal/repository"
 	"nexus-api/internal/service/scheduler"
 
@@ -83,9 +84,7 @@ func NewGatewayService(
 		modelRepo:      modelRepo,
 		resourceRepo:   resourceRepo,
 		channelRepo:    channelRepo,
-		httpClient: &http.Client{
-			Timeout: 5 * time.Minute,
-		},
+		httpClient: observability.NewHTTPClient(5 * time.Minute),
 		// ⭐ 新增：调度组件
 		providerSelector:     providerSelector,
 		instanceScheduler:    instanceScheduler,
@@ -129,6 +128,7 @@ type ChatCompletionRequest struct {
 	EnableCache    bool   `json:"-"`
 	BypassCache    bool   `json:"-"`
 	DisableDedup   bool   `json:"-"`
+	RequestContext context.Context `json:"-"`
 }
 
 // ChatMessage 聊天消息
@@ -193,6 +193,7 @@ type CompletionRequest struct {
 	EnableCache    bool   `json:"-"`
 	BypassCache    bool   `json:"-"`
 	DisableDedup   bool   `json:"-"`
+	RequestContext context.Context `json:"-"`
 }
 
 // CompletionResponse 完成响应
@@ -228,6 +229,14 @@ type EmbeddingRequest struct {
 	EnableCache    bool   `json:"-"`
 	BypassCache    bool   `json:"-"`
 	DisableDedup   bool   `json:"-"`
+	RequestContext context.Context `json:"-"`
+}
+
+func requestContextOrBackground(requestContext context.Context) context.Context {
+	if requestContext == nil {
+		return context.Background()
+	}
+	return requestContext
 }
 
 // EmbeddingResponse 嵌入响应
@@ -261,7 +270,7 @@ type ModelData struct {
 
 // HandleChatCompletion 处理聊天完成请求（带failover重试）
 func (s *gatewayService) HandleChatCompletion(req *ChatCompletionRequest, token *model.Token) (*ChatCompletionResponse, error) {
-	ctx := context.Background()
+	ctx := requestContextOrBackground(req.RequestContext)
 	startTime := time.Now()
 
 	// 获取模型定价
@@ -430,7 +439,7 @@ func (s *gatewayService) HandleChatCompletion(req *ChatCompletionRequest, token 
 
 // HandleChatCompletionStream 处理流式聊天完成请求（带Stream First-Chunk Failover）
 func (s *gatewayService) HandleChatCompletionStream(req *ChatCompletionRequest, token *model.Token, writer http.ResponseWriter) error {
-	ctx := context.Background()
+	ctx := requestContextOrBackground(req.RequestContext)
 	startTime := time.Now()
 
 	// 获取模型定价
@@ -684,7 +693,7 @@ func (s *gatewayService) HandleChatCompletionStream(req *ChatCompletionRequest, 
 
 // HandleCompletion 处理完成请求（带failover重试）
 func (s *gatewayService) HandleCompletion(req *CompletionRequest, token *model.Token) (*CompletionResponse, error) {
-	ctx := context.Background()
+	ctx := requestContextOrBackground(req.RequestContext)
 	startTime := time.Now()
 
 	// 获取模型定价
@@ -869,7 +878,7 @@ func (s *gatewayService) HandleCompletion(req *CompletionRequest, token *model.T
 
 // HandleEmbedding 处理嵌入请求（带failover重试）
 func (s *gatewayService) HandleEmbedding(req *EmbeddingRequest, token *model.Token) (*EmbeddingResponse, error) {
-	ctx := context.Background()
+	ctx := requestContextOrBackground(req.RequestContext)
 	startTime := time.Now()
 
 	// 获取模型定价

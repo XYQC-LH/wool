@@ -112,6 +112,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	quotaService := service.NewQuotaService(quotaPolicyRepo, alertService)
 	billingService := service.NewBillingService(db)
 	metricsService := service.NewMetricsService(db)
+	observabilityService := service.NewObservabilityService(db)
 	settingsService := service.NewSettingsService(systemSettingRepo)
 	tenantBillingHook := service.NewTenantBillingHook(cfg.RateLimit)
 
@@ -158,7 +159,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	gatewayHandler := handler.NewGatewayHandler(gatewayService)
 	adminHandler := handler.NewAdminHandler(userService, channelService, orderService, logService, modelService, resourceAccountRepo, announcementRepo, settingsService, alertService)
 	adminLogHandler := handler.NewAdminLogHandler(logService, auditLogService)
-	adminMetricsHandler := handler.NewAdminMetricsHandler(metricsService, alertService)
+	adminMetricsHandler := handler.NewAdminMetricsHandler(metricsService, alertService, observabilityService)
 	alertHandler := handler.NewAlertHandler(alertService)
 	assetHandler := handler.NewAssetHandler(assetService)
 	objectHandler := handler.NewObjectHandler(cfg.OSS.LocalDir, cfg.OSS.SignSecret)

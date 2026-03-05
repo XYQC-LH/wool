@@ -136,6 +136,9 @@ ADMIN_EMAIL=your_admin_email
 - Grafana: `http://localhost:${GRAFANA_PORT:-3002}`（默认账号 `admin` / `admin`）
 - Backend `/metrics`: `http://localhost:${API_PORT:-8080}/metrics`
 - Grafana 数据源：已通过 `grafana/provisioning/datasources/prometheus.yml` 自动接入 Prometheus
+- 内置链路字段：`X-Trace-ID`、`X-Span-ID`、`traceparent`（支持跨服务透传）
+- 管理端性能分析：`GET /api/admin/metrics/performance`
+- 管理端容量预测：`GET /api/admin/metrics/capacity/forecast`
 
 ### 前置要求
 

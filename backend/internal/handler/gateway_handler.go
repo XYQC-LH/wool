@@ -89,6 +89,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	applyGatewayControlHeadersToChat(c, &req)
+	req.RequestContext = c.Request.Context()
 
 	// 处理流式请求
 	if req.Stream {
@@ -182,6 +183,7 @@ func (h *GatewayHandler) Completions(c *gin.Context) {
 	}
 
 	applyGatewayControlHeadersToCompletion(c, &req)
+	req.RequestContext = c.Request.Context()
 
 	// 处理请求
 	resp, err := h.gatewayService.HandleCompletion(&req, token)
@@ -250,6 +252,7 @@ func (h *GatewayHandler) Embeddings(c *gin.Context) {
 	}
 
 	applyGatewayControlHeadersToEmbedding(c, &req)
+	req.RequestContext = c.Request.Context()
 
 	// 处理请求
 	resp, err := h.gatewayService.HandleEmbedding(&req, token)

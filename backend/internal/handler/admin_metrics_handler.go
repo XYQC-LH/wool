@@ -17,14 +17,23 @@ import (
 
 // AdminMetricsHandler 管理员监控管理处理器
 type AdminMetricsHandler struct {
-	metricsService service.MetricsService
-	alertService   service.AlertService
+	metricsService       service.MetricsService
+	alertService         service.AlertService
+	observabilityService service.ObservabilityService
 }
 
-func NewAdminMetricsHandler(metricsService service.MetricsService, alertService service.AlertService) *AdminMetricsHandler {
+func NewAdminMetricsHandler(metricsService service.MetricsService, alertService service.AlertService, observabilityService ...service.ObservabilityService) *AdminMetricsHandler {
+	var resolvedObservabilityService service.ObservabilityService
+	if len(observabilityService) > 0 && observabilityService[0] != nil {
+		resolvedObservabilityService = observabilityService[0]
+	} else {
+		resolvedObservabilityService = service.NewObservabilityService(nil)
+	}
+
 	return &AdminMetricsHandler{
-		metricsService: metricsService,
-		alertService:   alertService,
+		metricsService:       metricsService,
+		alertService:         alertService,
+		observabilityService: resolvedObservabilityService,
 	}
 }
 
@@ -163,11 +172,71 @@ func (h *AdminMetricsHandler) AlertStats(c *gin.Context) {
 	c.JSON(http.StatusOK, model.SuccessResponse(stats))
 }
 
+// Performance 性能分析
+func (h *AdminMetricsHandler) Performance(c *gin.Context) {
+	windowSeconds := parsePositiveInt(c.Query("window_seconds"), 3600)
+	if windowSeconds > 7*24*3600 {
+		windowSeconds = 7 * 24 * 3600
+	}
+
+	slowThresholdMs := int64(parsePositiveInt(c.Query("slow_threshold_ms"), 1000))
+	if slowThresholdMs > 120000 {
+		slowThresholdMs = 120000
+	}
+
+	topN := parsePositiveInt(c.Query("top_n"), 10)
+	if topN > 100 {
+		topN = 100
+	}
+
+	result, err := h.observabilityService.AnalyzePerformance(c.Request.Context(), &service.PerformanceAnalysisQuery{
+		Window:          time.Duration(windowSeconds) * time.Second,
+		SlowThresholdMs: slowThresholdMs,
+		TopN:            topN,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, model.ErrorResponse(model.ErrCodeInternalError, err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, model.SuccessResponse(result))
+}
+
+// CapacityForecast 容量预测
+func (h *AdminMetricsHandler) CapacityForecast(c *gin.Context) {
+	lookbackHours := parsePositiveInt(c.Query("lookback_hours"), 168)
+	if lookbackHours > 24*30 {
+		lookbackHours = 24 * 30
+	}
+
+	forecastHours := parsePositiveInt(c.Query("forecast_hours"), 24)
+	if forecastHours > 24*7 {
+		forecastHours = 24 * 7
+	}
+
+	result, err := h.observabilityService.ForecastCapacity(c.Request.Context(), &service.CapacityForecastQuery{
+		LookbackHours: lookbackHours,
+		ForecastHours: forecastHours,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "未初始化") {
+			c.JSON(http.StatusServiceUnavailable, model.ErrorResponse(model.ErrCodeInternalError, err.Error()))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, model.ErrorResponse(model.ErrCodeInternalError, err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, model.SuccessResponse(result))
+}
+
 func (h *AdminMetricsHandler) RegisterRoutes(router *gin.RouterGroup) {
 	group := router.Group("/metrics")
 	{
 		group.GET("/query", h.Query)
 		group.GET("/realtime", h.Realtime)
+		group.GET("/performance", h.Performance)
+		group.GET("/capacity/forecast", h.CapacityForecast)
 		group.GET("/alerts", h.ListAlerts)
 		group.PUT("/alerts/:id/resolve", h.ResolveAlert)
 		group.GET("/alerts/stats", h.AlertStats)

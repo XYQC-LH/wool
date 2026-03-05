@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"nexus-api/internal/model"
+	"nexus-api/internal/observability"
 	"nexus-api/internal/repository"
 	"nexus-api/internal/service/scheduler"
 
@@ -72,7 +73,7 @@ func NewAudioService(
 		instanceRepo:      instanceRepo,
 		healthTracker:     healthTracker,
 		cascadeController: cascadeController,
-		httpClient:        &http.Client{Timeout: 10 * time.Minute},
+		httpClient:        observability.NewHTTPClient(10 * time.Minute),
 	}
 }
 

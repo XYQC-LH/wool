@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"nexus-api/internal/model"
+	"nexus-api/internal/observability"
 	"nexus-api/internal/repository"
 )
 
@@ -354,7 +355,7 @@ func (s *channelService) TestChannel(id uint) (*ChannelTestResult, error) {
 		}
 	}
 
-	client := &http.Client{Timeout: timeout}
+	client := observability.NewHTTPClient(timeout)
 
 	var lastLatency int
 	var lastErr error

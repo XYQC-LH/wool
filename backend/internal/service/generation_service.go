@@ -16,6 +16,7 @@ import (
 
 	"nexus-api/internal/config"
 	"nexus-api/internal/model"
+	"nexus-api/internal/observability"
 	"nexus-api/internal/repository"
 	"nexus-api/internal/service/scheduler"
 	"nexus-api/internal/storage"
@@ -101,9 +102,7 @@ func NewGenerationService(
 		resourcePoolURL:   resourcePoolURL,
 		objStore:          objStore,
 		signExpireSeconds: signExpireSeconds,
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
+		httpClient:        observability.NewHTTPClient(timeout),
 	}
 }
 
