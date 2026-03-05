@@ -86,6 +86,7 @@ func (h *GatewayHandler) ChatCompletionsWebSocket(c *gin.Context) {
 			sendWebSocketOpenAIError(conn, openAIErr)
 			return
 		}
+		applyGatewayControlHeadersToChat(c, &req)
 
 		if req.Stream {
 			writer := newWebSocketStreamWriter(conn)
@@ -145,6 +146,7 @@ func (h *GatewayHandler) GRPCGateway(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, openAIErr)
 			return
 		}
+		applyGatewayControlHeadersToChat(c, &chatReq)
 
 		if chatReq.Stream {
 			c.Header("Content-Type", "text/event-stream")
@@ -176,6 +178,7 @@ func (h *GatewayHandler) GRPCGateway(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, openAIErr)
 			return
 		}
+		applyGatewayControlHeadersToCompletion(c, &completionReq)
 
 		resp, err := h.gatewayService.HandleCompletion(&completionReq, token)
 		if err != nil {
@@ -195,6 +198,7 @@ func (h *GatewayHandler) GRPCGateway(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, openAIErr)
 			return
 		}
+		applyGatewayControlHeadersToEmbedding(c, &embeddingReq)
 
 		resp, err := h.gatewayService.HandleEmbedding(&embeddingReq, token)
 		if err != nil {

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"nexus-api/internal/model"
@@ -227,6 +228,7 @@ func (s *modelProviderService) Create(ctx context.Context, req *CreateProviderRe
 
 	// 鍒锋柊缂撳瓨
 	_ = s.selector.RefreshCache(ctx, operation, req.ModelID)
+	InvalidateGatewayResponseCache(operation, req.ModelID)
 
 	return provider, nil
 }
@@ -289,6 +291,7 @@ func (s *modelProviderService) Update(ctx context.Context, id uint, req *UpdateP
 
 	// 鍒锋柊缂撳瓨
 	_ = s.selector.RefreshCache(ctx, model.NormalizeOperation(provider.Operation), provider.ModelID)
+	InvalidateGatewayResponseCache(provider.Operation, provider.ModelID)
 
 	return provider, nil
 }
@@ -312,6 +315,7 @@ func (s *modelProviderService) Delete(ctx context.Context, id uint) error {
 
 	// 鍒锋柊缂撳瓨
 	_ = s.selector.RefreshCache(ctx, operation, modelID)
+	InvalidateGatewayResponseCache(operation, modelID)
 
 	return nil
 }
@@ -390,6 +394,7 @@ func (s *modelProviderService) Enable(ctx context.Context, id uint) error {
 	}
 
 	_ = s.selector.RefreshCache(ctx, model.NormalizeOperation(provider.Operation), provider.ModelID)
+	InvalidateGatewayResponseCache(provider.Operation, provider.ModelID)
 	return nil
 }
 
@@ -409,13 +414,38 @@ func (s *modelProviderService) Disable(ctx context.Context, id uint) error {
 	}
 
 	_ = s.selector.RefreshCache(ctx, model.NormalizeOperation(provider.Operation), provider.ModelID)
+	InvalidateGatewayResponseCache(provider.Operation, provider.ModelID)
 	return nil
 }
 
 // BatchUpdateStatus 鎵归噺鏇存柊鐘舵€?
 func (s *modelProviderService) BatchUpdateStatus(ctx context.Context, ids []uint, status model.ProviderStatus) error {
+	affectedRouteKeys := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		provider, err := s.providerRepo.GetByID(ctx, id)
+		if err != nil {
+			return fmt.Errorf("加载源头失败: %w", err)
+		}
+		if provider == nil {
+			continue
+		}
+		operation := model.NormalizeOperation(provider.Operation)
+		affectedRouteKeys[operation+":"+provider.ModelID] = struct{}{}
+	}
+
 	if err := s.providerRepo.BatchUpdateStatus(ctx, ids, status); err != nil {
 		return fmt.Errorf("鎵归噺鏇存柊鐘舵€佸け璐? %w", err)
+	}
+	for key := range affectedRouteKeys {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		_ = s.selector.RefreshCache(ctx, parts[0], parts[1])
+		InvalidateGatewayResponseCache(parts[0], parts[1])
 	}
 	return nil
 }

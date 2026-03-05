@@ -75,6 +75,7 @@ const (
 	StrategyLeastConnections   InstanceSelectionStrategy = "least_connections"    // 最少连接
 	StrategyBestHealth         InstanceSelectionStrategy = "best_health"          // 最佳健康度
 	StrategyRandom             InstanceSelectionStrategy = "random"               // 随机
+	StrategyAdaptiveInstance   InstanceSelectionStrategy = "adaptive"             // 自适应
 )
 
 // DefaultInstanceSchedulerConfig 默认实例调度器配置
@@ -88,7 +89,7 @@ func DefaultInstanceSchedulerConfig() *InstanceSchedulerConfig {
 		DefaultMaxConcurrency:    10,
 		DefaultRPMLimit:          100,
 		DefaultTPMLimit:          10000,
-		SelectionStrategy:        StrategyWeightedRoundRobin,
+		SelectionStrategy:        StrategyAdaptiveInstance,
 	}
 }
 
@@ -221,6 +222,8 @@ func (s *instanceScheduler) selectByStrategy(ctx context.Context, instances []*m
 	s.mu.RUnlock()
 
 	switch strategy {
+	case StrategyAdaptiveInstance:
+		return s.selectAdaptive(ctx, instances)
 	case StrategyWeightedRoundRobin:
 		return s.selectWeightedRoundRobin(instances)
 	case StrategyLeastConnections:
@@ -232,6 +235,115 @@ func (s *instanceScheduler) selectByStrategy(ctx context.Context, instances []*m
 	default:
 		return s.selectWeightedRoundRobin(instances)
 	}
+}
+
+func (s *instanceScheduler) selectAdaptive(ctx context.Context, instances []*model.ProviderInstance) (*model.ProviderInstance, error) {
+	if len(instances) == 0 {
+		return nil, fmt.Errorf("实例列表为空")
+	}
+	if s == nil {
+		return instances[0], nil
+	}
+	if s.stateStore == nil {
+		return s.selectBestHealth(instances)
+	}
+
+	type scoredInstance struct {
+		instance      *model.ProviderInstance
+		score         float64
+		concurrency   int64
+		healthScore   float64
+		latencyScore  float64
+		weightScore   float64
+		successScore  float64
+	}
+
+	// 先收集并发上限，用于归一化
+	maxConcurrency := int64(1)
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		currentConcurrency, err := s.stateStore.GetInstanceConcurrency(ctx, inst.ID)
+		if err != nil {
+			currentConcurrency = 0
+		}
+		if currentConcurrency > maxConcurrency {
+			maxConcurrency = currentConcurrency
+		}
+	}
+
+	scored := make([]scoredInstance, 0, len(instances))
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+
+		concurrency, err := s.stateStore.GetInstanceConcurrency(ctx, inst.ID)
+		if err != nil {
+			concurrency = 0
+		}
+
+		successRate := inst.GetSuccessRate() / 100.0
+		if successRate < 0 {
+			successRate = 0
+		}
+		if successRate > 1 {
+			successRate = 1
+		}
+
+		latencyMs := inst.GetAvgLatency()
+		latencyScore := 1.0 - math.Min(float64(latencyMs)/5000.0, 1.0)
+
+		weight := inst.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		weightScore := math.Min(float64(weight)/100.0, 1.0)
+
+		concurrencyPenalty := 0.0
+		if maxConcurrency > 0 {
+			concurrencyPenalty = float64(concurrency) / float64(maxConcurrency)
+		}
+		if concurrencyPenalty < 0 {
+			concurrencyPenalty = 0
+		}
+		if concurrencyPenalty > 1 {
+			concurrencyPenalty = 1
+		}
+
+		healthScore := successRate*0.6 + latencyScore*0.4
+		total := healthScore*0.55 + weightScore*0.15 + (1.0-concurrencyPenalty)*0.30
+
+		scored = append(scored, scoredInstance{
+			instance:     inst,
+			score:        total,
+			concurrency:  concurrency,
+			healthScore:  healthScore,
+			latencyScore: latencyScore,
+			weightScore:  weightScore,
+			successScore: successRate,
+		})
+	}
+
+	if len(scored) == 0 {
+		return nil, fmt.Errorf("实例列表为空")
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		if scored[i].concurrency != scored[j].concurrency {
+			return scored[i].concurrency < scored[j].concurrency
+		}
+		if scored[i].instance.Weight != scored[j].instance.Weight {
+			return scored[i].instance.Weight > scored[j].instance.Weight
+		}
+		return scored[i].instance.ID < scored[j].instance.ID
+	})
+
+	return scored[0].instance, nil
 }
 
 // selectWeightedRoundRobin 加权轮询选择

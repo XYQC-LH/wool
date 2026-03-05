@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/net/websocket"
 )
 
@@ -44,6 +45,7 @@ type gatewayServiceV2 struct {
 	healthTracker     scheduler.HealthTracker
 	costCalculator    scheduler.CostCalculator
 	tenantBillingHook TenantBillingHook
+	requestDeduper    singleflight.Group
 }
 
 // NewGatewayServiceV2 创建增强版 Gateway 服务
@@ -162,10 +164,32 @@ func (s *gatewayServiceV2) HandleChatCompletion(req *ChatCompletionRequest, toke
 		return nil, &QuotaExceededError{Needed: estimatedCost, Remaining: *token.RemainQuota}
 	}
 
-	return s.handleChatCompletionWithScheduler(ctx, req, token, modelPricing, startTime)
+	operation := model.OperationChatCompletions
+	ctx = s.applyGatewayTrafficHints(ctx, operation, req.Model, scheduler.TrafficHints{
+		SessionID:      req.SessionID,
+		TrafficTag:     req.TrafficTag,
+		ExperimentID:   req.ExperimentID,
+		IdempotencyKey: req.IdempotencyKey,
+		ForceCanary:    req.ForceCanary,
+	})
+
+	control := gatewayRequestControl{
+		Operation:      operation,
+		ModelID:        req.Model,
+		IdempotencyKey: req.IdempotencyKey,
+		EnableCache:    req.EnableCache,
+		BypassCache:    req.BypassCache,
+		DisableDedup:   req.DisableDedup,
+	}
+
+	return s.executeWithTrafficOptimization(ctx, token, req, control, func(execCtx context.Context) (*ChatCompletionResponse, error) {
+		return s.handleChatCompletionWithScheduler(execCtx, req, token, modelPricing, startTime)
+	})
 }
 
 func (s *gatewayServiceV2) handleChatCompletionWithScheduler(ctx context.Context, req *ChatCompletionRequest, token *model.Token, modelPricing *model.ModelPricing, startTime time.Time) (*ChatCompletionResponse, error) {
+	_ = modelPricing
+
 	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
 		return s.executeProviderRequest(execCtx, provider, req)
 	}
@@ -173,7 +197,7 @@ func (s *gatewayServiceV2) handleChatCompletionWithScheduler(ctx context.Context
 	promptTokens, completionTokens := s.estimateChatTokens(req)
 	rateCtx := scheduler.WithRateLimitUsage(ctx, buildTokenRateLimitUsage(promptTokens, completionTokens))
 
-	result, err := s.cascadeController.ExecuteWithStrategy(rateCtx, model.OperationChatCompletions, req.Model, scheduler.StrategyCostFirst, executor)
+	result, err := s.cascadeController.ExecuteWithStrategy(rateCtx, model.OperationChatCompletions, req.Model, scheduler.StrategyAdaptive, executor)
 	if result != nil {
 		s.cascadeMetrics.RecordResult(result)
 	}
@@ -347,11 +371,20 @@ func (s *gatewayServiceV2) HandleChatCompletionStream(req *ChatCompletionRequest
 	}
 
 	req.Stream = true
+	ctx = s.applyGatewayTrafficHints(ctx, model.OperationChatCompletions, req.Model, scheduler.TrafficHints{
+		SessionID:      req.SessionID,
+		TrafficTag:     req.TrafficTag,
+		ExperimentID:   req.ExperimentID,
+		IdempotencyKey: req.IdempotencyKey,
+		ForceCanary:    req.ForceCanary,
+	})
 
 	return s.handleStreamWithScheduler(ctx, req, token, modelPricing, writer, startTime)
 }
 
 func (s *gatewayServiceV2) handleStreamWithScheduler(ctx context.Context, req *ChatCompletionRequest, token *model.Token, modelPricing *model.ModelPricing, writer http.ResponseWriter, startTime time.Time) error {
+	_ = modelPricing
+
 	maxTokens := 0
 	if req.MaxTokens != nil {
 		maxTokens = *req.MaxTokens
@@ -383,7 +416,7 @@ func (s *gatewayServiceV2) handleStreamWithScheduler(ctx context.Context, req *C
 	}
 
 	rateCtx := scheduler.WithRateLimitUsage(ctx, buildTokenRateLimitUsage(estimatedPromptTokens, estimatedCompletionTokens))
-	result, err := s.cascadeController.ExecuteStreamWithFailover(rateCtx, model.OperationChatCompletions, req.Model, scheduler.StrategyCostFirst, executor)
+	result, err := s.cascadeController.ExecuteStreamWithFailover(rateCtx, model.OperationChatCompletions, req.Model, scheduler.StrategyAdaptive, executor)
 	if result != nil {
 		s.cascadeMetrics.RecordResult(result)
 	}
@@ -437,63 +470,82 @@ func (s *gatewayServiceV2) HandleCompletion(req *CompletionRequest, token *model
 		return nil, err
 	}
 
-	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
-		return s.executeCompletionProviderRequest(execCtx, provider, req)
-	}
-
 	operation := model.OperationCompletions
-	usedOperation := operation
-	rateCtx := scheduler.WithRateLimitUsage(ctx, buildTokenRateLimitUsage(estimatedPromptTokens, estimatedCompletionTokens))
-	result, err := s.cascadeController.ExecuteWithStrategy(rateCtx, operation, req.Model, scheduler.StrategyCostFirst, executor)
-	if err != nil {
-		var noProviders *scheduler.NoAvailableProviderError
-		if errors.As(err, &noProviders) {
-			usedOperation = model.OperationChatCompletions
-			result, err = s.cascadeController.ExecuteWithStrategy(rateCtx, usedOperation, req.Model, scheduler.StrategyCostFirst, executor)
+	ctx = s.applyGatewayTrafficHints(ctx, operation, req.Model, scheduler.TrafficHints{
+		SessionID:      req.SessionID,
+		TrafficTag:     req.TrafficTag,
+		ExperimentID:   req.ExperimentID,
+		IdempotencyKey: req.IdempotencyKey,
+		ForceCanary:    req.ForceCanary,
+	})
+
+	control := gatewayRequestControl{
+		Operation:      operation,
+		ModelID:        req.Model,
+		IdempotencyKey: req.IdempotencyKey,
+		EnableCache:    req.EnableCache,
+		BypassCache:    req.BypassCache,
+		DisableDedup:   req.DisableDedup,
+	}
+
+	return s.executeWithTrafficOptimization(ctx, token, req, control, func(execCtx context.Context) (*CompletionResponse, error) {
+		executor := func(callCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
+			return s.executeCompletionProviderRequest(callCtx, provider, req)
 		}
-	}
-	if err != nil {
-		s.logProviderRequest(token, nil, usedOperation, req.Model, &Usage{}, decimal.Zero, decimal.Zero, int(time.Since(startTime).Milliseconds()), model.LogStatusError, err.Error())
-		return nil, err
-	}
-	if result == nil || result.Response == nil {
-		return nil, fmt.Errorf("调度结果为空")
-	}
 
-	completionResp, ok := result.Response.(*CompletionResponse)
-	if !ok || completionResp == nil {
-		return nil, fmt.Errorf("完成响应解析失败")
-	}
-
-	latencyMs := int(time.Since(startTime).Milliseconds())
-
-	usage := completionResp.Usage
-	if usage == nil {
-		usage = &Usage{}
-	}
-
-	cost, _ := s.costCalculator.CalculateCost(req.Model, usage.PromptTokens, usage.CompletionTokens)
-	upstreamCost := s.costCalculator.CalculateProviderCost(result.Provider, usage.PromptTokens, usage.CompletionTokens)
-
-	if token.User != nil {
-		if err := DeductUserBalance(s.userRepo, token.UserID, cost, &token.User.Balance); err != nil {
-			s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, decimal.Zero, decimal.Zero, latencyMs, model.LogStatusError, err.Error())
+		usedOperation := operation
+		rateCtx := scheduler.WithRateLimitUsage(execCtx, buildTokenRateLimitUsage(estimatedPromptTokens, estimatedCompletionTokens))
+		result, err := s.cascadeController.ExecuteWithStrategy(rateCtx, operation, req.Model, scheduler.StrategyAdaptive, executor)
+		if err != nil {
+			var noProviders *scheduler.NoAvailableProviderError
+			if errors.As(err, &noProviders) {
+				usedOperation = model.OperationChatCompletions
+				result, err = s.cascadeController.ExecuteWithStrategy(rateCtx, usedOperation, req.Model, scheduler.StrategyAdaptive, executor)
+			}
+		}
+		if err != nil {
+			s.logProviderRequest(token, nil, usedOperation, req.Model, &Usage{}, decimal.Zero, decimal.Zero, int(time.Since(startTime).Milliseconds()), model.LogStatusError, err.Error())
 			return nil, err
 		}
-	}
-	if token.RemainQuota != nil {
-		if err := s.tokenService.DeductQuota(token.ID, cost); err != nil {
-			s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, decimal.Zero, decimal.Zero, latencyMs, model.LogStatusError, err.Error())
-			return nil, err
+		if result == nil || result.Response == nil {
+			return nil, fmt.Errorf("调度结果为空")
 		}
-	}
-	if result.Provider != nil {
-		_ = s.providerRepo.IncrementStats(ctx, result.Provider.ID, true, int64(latencyMs), int64(usage.PromptTokens), int64(usage.CompletionTokens), upstreamCost)
-	}
-	s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, cost, upstreamCost, latencyMs, model.LogStatusSuccess, "")
-	s.emitTenantBilling(ctx, token, usedOperation, req.Model, usage, cost)
 
-	return completionResp, nil
+		completionResp, ok := result.Response.(*CompletionResponse)
+		if !ok || completionResp == nil {
+			return nil, fmt.Errorf("完成响应解析失败")
+		}
+
+		latencyMs := int(time.Since(startTime).Milliseconds())
+
+		usage := completionResp.Usage
+		if usage == nil {
+			usage = &Usage{}
+		}
+
+		cost, _ := s.costCalculator.CalculateCost(req.Model, usage.PromptTokens, usage.CompletionTokens)
+		upstreamCost := s.costCalculator.CalculateProviderCost(result.Provider, usage.PromptTokens, usage.CompletionTokens)
+
+		if token.User != nil {
+			if err := DeductUserBalance(s.userRepo, token.UserID, cost, &token.User.Balance); err != nil {
+				s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, decimal.Zero, decimal.Zero, latencyMs, model.LogStatusError, err.Error())
+				return nil, err
+			}
+		}
+		if token.RemainQuota != nil {
+			if err := s.tokenService.DeductQuota(token.ID, cost); err != nil {
+				s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, decimal.Zero, decimal.Zero, latencyMs, model.LogStatusError, err.Error())
+				return nil, err
+			}
+		}
+		if result.Provider != nil {
+			_ = s.providerRepo.IncrementStats(execCtx, result.Provider.ID, true, int64(latencyMs), int64(usage.PromptTokens), int64(usage.CompletionTokens), upstreamCost)
+		}
+		s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, cost, upstreamCost, latencyMs, model.LogStatusSuccess, "")
+		s.emitTenantBilling(execCtx, token, usedOperation, req.Model, usage, cost)
+
+		return completionResp, nil
+	})
 }
 
 // HandleEmbedding 处理嵌入请求
@@ -507,63 +559,82 @@ func (s *gatewayServiceV2) HandleEmbedding(req *EmbeddingRequest, token *model.T
 		return nil, err
 	}
 
-	executor := func(execCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
-		return s.executeEmbeddingProviderRequest(execCtx, provider, req)
-	}
-
 	operation := model.OperationEmbeddings
-	usedOperation := operation
-	rateCtx := scheduler.WithRateLimitUsage(ctx, buildTokenRateLimitUsage(estimatedPromptTokens, 0))
-	result, err := s.cascadeController.ExecuteWithStrategy(rateCtx, operation, req.Model, scheduler.StrategyCostFirst, executor)
-	if err != nil {
-		var noProviders *scheduler.NoAvailableProviderError
-		if errors.As(err, &noProviders) {
-			usedOperation = model.OperationChatCompletions
-			result, err = s.cascadeController.ExecuteWithStrategy(rateCtx, usedOperation, req.Model, scheduler.StrategyCostFirst, executor)
+	ctx = s.applyGatewayTrafficHints(ctx, operation, req.Model, scheduler.TrafficHints{
+		SessionID:      req.SessionID,
+		TrafficTag:     req.TrafficTag,
+		ExperimentID:   req.ExperimentID,
+		IdempotencyKey: req.IdempotencyKey,
+		ForceCanary:    req.ForceCanary,
+	})
+
+	control := gatewayRequestControl{
+		Operation:      operation,
+		ModelID:        req.Model,
+		IdempotencyKey: req.IdempotencyKey,
+		EnableCache:    req.EnableCache,
+		BypassCache:    req.BypassCache,
+		DisableDedup:   req.DisableDedup,
+	}
+
+	return s.executeWithTrafficOptimization(ctx, token, req, control, func(execCtx context.Context) (*EmbeddingResponse, error) {
+		executor := func(callCtx context.Context, provider *model.ModelProvider) (interface{}, error) {
+			return s.executeEmbeddingProviderRequest(callCtx, provider, req)
 		}
-	}
-	if err != nil {
-		s.logProviderRequest(token, nil, usedOperation, req.Model, &Usage{}, decimal.Zero, decimal.Zero, int(time.Since(startTime).Milliseconds()), model.LogStatusError, err.Error())
-		return nil, err
-	}
-	if result == nil || result.Response == nil {
-		return nil, fmt.Errorf("调度结果为空")
-	}
 
-	embeddingResp, ok := result.Response.(*EmbeddingResponse)
-	if !ok || embeddingResp == nil {
-		return nil, fmt.Errorf("嵌入响应解析失败")
-	}
-
-	latencyMs := int(time.Since(startTime).Milliseconds())
-
-	usage := embeddingResp.Usage
-	if usage == nil {
-		usage = &Usage{}
-	}
-
-	cost, _ := s.costCalculator.CalculateCost(req.Model, usage.PromptTokens, usage.CompletionTokens)
-	upstreamCost := s.costCalculator.CalculateProviderCost(result.Provider, usage.PromptTokens, usage.CompletionTokens)
-
-	if token.User != nil {
-		if err := DeductUserBalance(s.userRepo, token.UserID, cost, &token.User.Balance); err != nil {
-			s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, decimal.Zero, decimal.Zero, latencyMs, model.LogStatusError, err.Error())
+		usedOperation := operation
+		rateCtx := scheduler.WithRateLimitUsage(execCtx, buildTokenRateLimitUsage(estimatedPromptTokens, 0))
+		result, err := s.cascadeController.ExecuteWithStrategy(rateCtx, operation, req.Model, scheduler.StrategyAdaptive, executor)
+		if err != nil {
+			var noProviders *scheduler.NoAvailableProviderError
+			if errors.As(err, &noProviders) {
+				usedOperation = model.OperationChatCompletions
+				result, err = s.cascadeController.ExecuteWithStrategy(rateCtx, usedOperation, req.Model, scheduler.StrategyAdaptive, executor)
+			}
+		}
+		if err != nil {
+			s.logProviderRequest(token, nil, usedOperation, req.Model, &Usage{}, decimal.Zero, decimal.Zero, int(time.Since(startTime).Milliseconds()), model.LogStatusError, err.Error())
 			return nil, err
 		}
-	}
-	if token.RemainQuota != nil {
-		if err := s.tokenService.DeductQuota(token.ID, cost); err != nil {
-			s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, decimal.Zero, decimal.Zero, latencyMs, model.LogStatusError, err.Error())
-			return nil, err
+		if result == nil || result.Response == nil {
+			return nil, fmt.Errorf("调度结果为空")
 		}
-	}
-	if result.Provider != nil {
-		_ = s.providerRepo.IncrementStats(ctx, result.Provider.ID, true, int64(latencyMs), int64(usage.PromptTokens), int64(usage.CompletionTokens), upstreamCost)
-	}
-	s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, cost, upstreamCost, latencyMs, model.LogStatusSuccess, "")
-	s.emitTenantBilling(ctx, token, usedOperation, req.Model, usage, cost)
 
-	return embeddingResp, nil
+		embeddingResp, ok := result.Response.(*EmbeddingResponse)
+		if !ok || embeddingResp == nil {
+			return nil, fmt.Errorf("嵌入响应解析失败")
+		}
+
+		latencyMs := int(time.Since(startTime).Milliseconds())
+
+		usage := embeddingResp.Usage
+		if usage == nil {
+			usage = &Usage{}
+		}
+
+		cost, _ := s.costCalculator.CalculateCost(req.Model, usage.PromptTokens, usage.CompletionTokens)
+		upstreamCost := s.costCalculator.CalculateProviderCost(result.Provider, usage.PromptTokens, usage.CompletionTokens)
+
+		if token.User != nil {
+			if err := DeductUserBalance(s.userRepo, token.UserID, cost, &token.User.Balance); err != nil {
+				s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, decimal.Zero, decimal.Zero, latencyMs, model.LogStatusError, err.Error())
+				return nil, err
+			}
+		}
+		if token.RemainQuota != nil {
+			if err := s.tokenService.DeductQuota(token.ID, cost); err != nil {
+				s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, decimal.Zero, decimal.Zero, latencyMs, model.LogStatusError, err.Error())
+				return nil, err
+			}
+		}
+		if result.Provider != nil {
+			_ = s.providerRepo.IncrementStats(execCtx, result.Provider.ID, true, int64(latencyMs), int64(usage.PromptTokens), int64(usage.CompletionTokens), upstreamCost)
+		}
+		s.logProviderRequest(token, result.Provider, usedOperation, req.Model, usage, cost, upstreamCost, latencyMs, model.LogStatusSuccess, "")
+		s.emitTenantBilling(execCtx, token, usedOperation, req.Model, usage, cost)
+
+		return embeddingResp, nil
+	})
 }
 
 // ListModels 列出可用模型

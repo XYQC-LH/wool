@@ -120,6 +120,15 @@ type ChatCompletionRequest struct {
 	Tools            []interface{}          `json:"tools,omitempty"`
 	ToolChoice       interface{}            `json:"tool_choice,omitempty"`
 	ResponseFormat   map[string]interface{} `json:"response_format,omitempty"`
+
+	SessionID      string `json:"-"`
+	TrafficTag     string `json:"-"`
+	ExperimentID   string `json:"-"`
+	ForceCanary    bool   `json:"-"`
+	IdempotencyKey string `json:"-"`
+	EnableCache    bool   `json:"-"`
+	BypassCache    bool   `json:"-"`
+	DisableDedup   bool   `json:"-"`
 }
 
 // ChatMessage 聊天消息
@@ -175,6 +184,15 @@ type CompletionRequest struct {
 	BestOf           *int               `json:"best_of,omitempty"`
 	LogitBias        map[string]float64 `json:"logit_bias,omitempty"`
 	User             string             `json:"user,omitempty"`
+
+	SessionID      string `json:"-"`
+	TrafficTag     string `json:"-"`
+	ExperimentID   string `json:"-"`
+	ForceCanary    bool   `json:"-"`
+	IdempotencyKey string `json:"-"`
+	EnableCache    bool   `json:"-"`
+	BypassCache    bool   `json:"-"`
+	DisableDedup   bool   `json:"-"`
 }
 
 // CompletionResponse 完成响应
@@ -201,6 +219,15 @@ type EmbeddingRequest struct {
 	Input          interface{} `json:"input"`
 	User           string      `json:"user,omitempty"`
 	EncodingFormat string      `json:"encoding_format,omitempty"`
+
+	SessionID      string `json:"-"`
+	TrafficTag     string `json:"-"`
+	ExperimentID   string `json:"-"`
+	ForceCanary    bool   `json:"-"`
+	IdempotencyKey string `json:"-"`
+	EnableCache    bool   `json:"-"`
+	BypassCache    bool   `json:"-"`
+	DisableDedup   bool   `json:"-"`
 }
 
 // EmbeddingResponse 嵌入响应

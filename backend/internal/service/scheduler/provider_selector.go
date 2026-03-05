@@ -18,6 +18,8 @@ type SelectionStrategy string
 const (
 	// StrategyCostFirst 成本优先（默认）
 	StrategyCostFirst SelectionStrategy = "cost_first"
+	// StrategyAdaptive 自适应（健康/成本/延迟）
+	StrategyAdaptive SelectionStrategy = "adaptive"
 	// StrategyLatencyFirst 延迟优先
 	StrategyLatencyFirst SelectionStrategy = "latency_first"
 	// StrategyHealthFirst 健康度优先
@@ -92,6 +94,9 @@ func (s *providerSelector) SelectProviders(ctx context.Context, operation string
 	switch strategy {
 	case StrategyCostFirst:
 		s.sortByCost(ctx, operation, result)
+	case StrategyAdaptive:
+		s.sortByAdaptive(ctx, operation, result)
+		s.applyRoundRobin(s.cacheKey(operation, modelID), result)
 	case StrategyLatencyFirst:
 		s.sortByLatency(result)
 	case StrategyHealthFirst:
@@ -317,6 +322,145 @@ func (s *providerSelector) sortByLatency(providers []*model.ModelProvider) {
 		costI := providers[i].ActualCostPer1kInput.Add(providers[i].ActualCostPer1kOutput)
 		costJ := providers[j].ActualCostPer1kInput.Add(providers[j].ActualCostPer1kOutput)
 		return costI.Cmp(costJ) < 0
+	})
+}
+
+// sortByAdaptive 按综合评分排序（健康/成本/延迟/权重）
+func (s *providerSelector) sortByAdaptive(ctx context.Context, operation string, providers []*model.ModelProvider) {
+	if len(providers) <= 1 {
+		return
+	}
+
+	type adaptiveScore struct {
+		score       float64
+		cost        float64
+		latencyMs   int64
+		healthScore float64
+		weightScore float64
+	}
+
+	scoreMap := make(map[uint]adaptiveScore, len(providers))
+
+	minCost := 0.0
+	maxCost := 0.0
+	minLatency := int64(0)
+	maxLatency := int64(0)
+	maxWeight := 1
+
+	for i, provider := range providers {
+		if provider == nil {
+			continue
+		}
+
+		cost := s.estimateProviderCost(ctx, operation, provider).InexactFloat64()
+		if cost < 0 {
+			cost = 0
+		}
+
+		latencyMs := int64(provider.AvgLatencyMs)
+		if latencyMs <= 0 && provider.TotalRequests > 0 {
+			latencyMs = provider.TotalLatency / provider.TotalRequests
+		}
+		if latencyMs < 0 {
+			latencyMs = 0
+		}
+
+		weight := provider.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+
+		if i == 0 {
+			minCost, maxCost = cost, cost
+			minLatency, maxLatency = latencyMs, latencyMs
+			maxWeight = weight
+		} else {
+			if cost < minCost {
+				minCost = cost
+			}
+			if cost > maxCost {
+				maxCost = cost
+			}
+			if latencyMs < minLatency {
+				minLatency = latencyMs
+			}
+			if latencyMs > maxLatency {
+				maxLatency = latencyMs
+			}
+			if weight > maxWeight {
+				maxWeight = weight
+			}
+		}
+
+		scoreMap[provider.ID] = adaptiveScore{
+			cost:      cost,
+			latencyMs: latencyMs,
+		}
+	}
+
+	costRange := maxCost - minCost
+	latencyRange := float64(maxLatency - minLatency)
+	maxWeightFloat := float64(maxWeight)
+	if maxWeightFloat <= 0 {
+		maxWeightFloat = 1
+	}
+
+	for _, provider := range providers {
+		if provider == nil {
+			continue
+		}
+
+		raw := scoreMap[provider.ID]
+		costNorm := 1.0
+		if costRange > 0 {
+			costNorm = 1.0 - (raw.cost-minCost)/costRange
+		}
+
+		latencyNorm := 1.0
+		if latencyRange > 0 {
+			latencyNorm = 1.0 - float64(raw.latencyMs-minLatency)/latencyRange
+		}
+
+		healthNorm := provider.HealthScore.InexactFloat64() / 100.0
+		if healthNorm < 0 {
+			healthNorm = 0
+		}
+		if healthNorm > 1 {
+			healthNorm = 1
+		}
+
+		weight := provider.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		weightNorm := float64(weight) / maxWeightFloat
+
+		// 权重分配：
+		// 成本 35%，延迟 25%，健康 30%，静态权重 10%。
+		total := costNorm*0.35 + latencyNorm*0.25 + healthNorm*0.30 + weightNorm*0.10
+		raw.score = total
+		raw.healthScore = healthNorm
+		raw.weightScore = weightNorm
+		scoreMap[provider.ID] = raw
+	}
+
+	sort.Slice(providers, func(i, j int) bool {
+		left := scoreMap[providers[i].ID]
+		right := scoreMap[providers[j].ID]
+
+		if left.score != right.score {
+			return left.score > right.score
+		}
+		if left.healthScore != right.healthScore {
+			return left.healthScore > right.healthScore
+		}
+		if left.cost != right.cost {
+			return left.cost < right.cost
+		}
+		if providers[i].Weight != providers[j].Weight {
+			return providers[i].Weight > providers[j].Weight
+		}
+		return providers[i].Priority < providers[j].Priority
 	})
 }
 

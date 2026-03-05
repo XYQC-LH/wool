@@ -88,6 +88,15 @@ type RuntimeStateStore interface {
 	// GetStreamInfo 获取流式请求信息
 	GetStreamInfo(ctx context.Context, streamID string) (*StreamInfo, error)
 
+	// ==================== 会话亲和（Session Affinity） ====================
+
+	// GetSessionAffinity 获取会话亲和路由信息
+	GetSessionAffinity(ctx context.Context, sessionKey string) (*SessionAffinity, error)
+	// SetSessionAffinity 设置会话亲和路由信息
+	SetSessionAffinity(ctx context.Context, sessionKey string, affinity *SessionAffinity, ttl time.Duration) error
+	// DeleteSessionAffinity 删除会话亲和路由信息
+	DeleteSessionAffinity(ctx context.Context, sessionKey string) error
+
 	// ==================== Job 提交点（Commit Point） ====================
 
 	// GetJobCommit 获取 Job 提交锁
@@ -122,6 +131,16 @@ type StreamInfo struct {
 	StartedAt    time.Time  `json:"started_at"`
 	FirstChunkAt *time.Time `json:"first_chunk_at,omitempty"`
 	Locked       bool       `json:"locked"`
+}
+
+// SessionAffinity 会话亲和路由信息
+type SessionAffinity struct {
+	SessionKey string    `json:"session_key"`
+	Operation  string    `json:"operation"`
+	ModelID    string    `json:"model_id"`
+	ProviderID uint      `json:"provider_id"`
+	InstanceID uint      `json:"instance_id"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // JobCommitInfo Job 提交锁信息
@@ -159,6 +178,7 @@ const (
 	keyStreamInfo           = "stream:info:%s"              // stream:info:{stream_id} -> StreamInfo
 	keyInstanceCircuitState = "instance:circuit:state:%d"   // instance:circuit:state:{instance_id} -> CircuitState
 	keyInstanceFailureCount = "instance:circuit:failure:%d" // instance:circuit:failure:{instance_id} -> int
+	keySessionAffinity      = "session:affinity:%s"         // session:affinity:{session_key} -> SessionAffinity
 	keyJobCommit            = "job:commit:%s"               // job:commit:{job_id} -> JobCommitInfo
 )
 
@@ -545,6 +565,59 @@ func (s *runtimeStateStore) GetStreamInfo(ctx context.Context, streamID string) 
 	}
 
 	return &info, nil
+}
+
+// ==================== 会话亲和（Session Affinity） ====================
+
+func (s *runtimeStateStore) GetSessionAffinity(ctx context.Context, sessionKey string) (*SessionAffinity, error) {
+	_ = ctx
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil, nil
+	}
+
+	key := fmt.Sprintf(keySessionAffinity, sessionKey)
+	var affinity SessionAffinity
+	if err := cache.Get(key, &affinity); err != nil {
+		return nil, nil
+	}
+	if affinity.SessionKey == "" {
+		affinity.SessionKey = sessionKey
+	}
+	return &affinity, nil
+}
+
+func (s *runtimeStateStore) SetSessionAffinity(ctx context.Context, sessionKey string, affinity *SessionAffinity, ttl time.Duration) error {
+	_ = ctx
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil
+	}
+	if affinity == nil {
+		return fmt.Errorf("session affinity 不能为空")
+	}
+	if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+
+	payload := *affinity
+	payload.SessionKey = sessionKey
+	payload.Operation = strings.TrimSpace(payload.Operation)
+	payload.ModelID = strings.TrimSpace(payload.ModelID)
+	payload.UpdatedAt = time.Now()
+
+	key := fmt.Sprintf(keySessionAffinity, sessionKey)
+	return cache.Set(key, &payload, ttl)
+}
+
+func (s *runtimeStateStore) DeleteSessionAffinity(ctx context.Context, sessionKey string) error {
+	_ = ctx
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil
+	}
+	key := fmt.Sprintf(keySessionAffinity, sessionKey)
+	return cache.Delete(key)
 }
 
 // ==================== 实例熔断器状态 ====================

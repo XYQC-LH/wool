@@ -99,12 +99,13 @@ type cascadeController struct {
 	capabilityMatcher     CapabilityMatcher
 	routeResolver         RouteResolver
 	sourceAdapterRegistry SourceAdapterRegistry
-	dispatchAttemptRepo repository.DispatchAttemptRepository
-	rateLimiter          ProviderRateLimiter
-	providerRepo         repository.ModelProviderRepository
-	metricsRepo          repository.ProviderMetricsRepository
-	config               *CascadeConfig
-	mu                   sync.RWMutex
+	dispatchAttemptRepo   repository.DispatchAttemptRepository
+	rateLimiter           ProviderRateLimiter
+	providerRepo          repository.ModelProviderRepository
+	metricsRepo           repository.ProviderMetricsRepository
+	stateStore            RuntimeStateStore
+	config                *CascadeConfig
+	mu                    sync.RWMutex
 }
 
 // NewCascadeController 鍒涘缓绾ц仈鎺у埗鍣?
@@ -122,6 +123,7 @@ func NewCascadeController(
 	routeResolver RouteResolver,
 	dispatchAttemptRepo repository.DispatchAttemptRepository,
 	rateLimiter ProviderRateLimiter,
+	stateStore RuntimeStateStore,
 	config *CascadeConfig,
 	sourceAdapterRegistries ...SourceAdapterRegistry,
 ) CascadeController {
@@ -143,11 +145,12 @@ func NewCascadeController(
 		capabilityMatcher:     capabilityMatcher,
 		routeResolver:         routeResolver,
 		sourceAdapterRegistry: sourceAdapterRegistry,
-		dispatchAttemptRepo: dispatchAttemptRepo,
-		rateLimiter:          rateLimiter,
-		providerRepo:         providerRepo,
-		metricsRepo:          metricsRepo,
-		config:               config,
+		dispatchAttemptRepo:   dispatchAttemptRepo,
+		rateLimiter:           rateLimiter,
+		providerRepo:          providerRepo,
+		metricsRepo:           metricsRepo,
+		stateStore:            stateStore,
+		config:                config,
 	}
 }
 
@@ -352,6 +355,7 @@ func (c *cascadeController) ExecuteWithStrategy(ctx context.Context, operation s
 			Success:           true,
 			LatencyMs:         attemptLatency,
 		})
+		c.persistSessionAffinity(ctx, operation, resolvedModelID, provider)
 
 		return result, nil
 	}
@@ -510,6 +514,7 @@ func (c *cascadeController) ExecuteOnProvider(ctx context.Context, operation str
 		Success:           true,
 		LatencyMs:         attemptLatency,
 	})
+	c.persistSessionAffinity(ctx, operation, resolvedModelID, provider)
 
 	return result, nil
 }
@@ -621,7 +626,9 @@ func (c *cascadeController) buildProvidersForDispatch(ctx context.Context, opera
 			}
 		}
 
-		return resolvedModelID, c.applyHealthGate(matchedProviders), nil
+		healthy := c.applyHealthGate(matchedProviders)
+		ranked := c.rankProviders(operation, strategy, healthy)
+		return resolvedModelID, c.applyTrafficGovernance(ctx, operation, resolvedModelID, ranked), nil
 	}
 
 	routeModels, err := c.resolveRouteModels(ctx, operation, resolvedModelID)
@@ -685,7 +692,7 @@ func (c *cascadeController) buildProvidersForDispatch(ctx context.Context, opera
 		}
 	}
 
-	return resolvedModelID, merged, nil
+	return resolvedModelID, c.applyTrafficGovernance(ctx, operation, resolvedModelID, merged), nil
 }
 
 func (c *cascadeController) resolveRouteModels(ctx context.Context, operation string, resolvedModelID string) ([]string, error) {
@@ -755,6 +762,8 @@ func (c *cascadeController) rankProviders(operation string, strategy SelectionSt
 	}
 
 	switch strategy {
+	case StrategyAdaptive:
+		selector.sortByAdaptive(context.Background(), operation, ranked)
 	case StrategyLatencyFirst:
 		selector.sortByLatency(ranked)
 	case StrategyHealthFirst:
@@ -1231,6 +1240,7 @@ func (c *cascadeController) ExecuteStreamWithFailover(ctx context.Context, opera
 			Success:          true,
 			LatencyMs:        attemptLatency,
 		})
+		c.persistSessionAffinity(ctx, operation, resolvedModelID, provider)
 
 		return result, nil
 	}

@@ -107,6 +107,7 @@ func main() {
 		routeResolver,
 		dispatchAttemptRepo,
 		providerRateLimiter,
+		runtimeStateStore,
 		nil,
 		sourceAdapterRegistry,
 	)

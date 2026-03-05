@@ -120,6 +120,7 @@ func (s *modelRouteService) Create(ctx context.Context, req *CreateModelRouteReq
 	if err := s.routeRepo.Create(ctx, entity); err != nil {
 		return nil, fmt.Errorf("创建路由映射失败: %w", err)
 	}
+	InvalidateGatewayResponseCache(operation, modelID)
 	return s.routeRepo.GetByID(ctx, entity.ID)
 }
 
@@ -135,6 +136,8 @@ func (s *modelRouteService) Update(ctx context.Context, id uint, req *UpdateMode
 	if entity == nil {
 		return nil, fmt.Errorf("路由映射不存在: %d", id)
 	}
+	previousOperation := entity.Operation
+	previousModelID := entity.ModelID
 
 	operation := model.NormalizeOperation(entity.Operation)
 	modelID := strings.TrimSpace(entity.ModelID)
@@ -185,11 +188,20 @@ func (s *modelRouteService) Update(ctx context.Context, id uint, req *UpdateMode
 	if err := s.routeRepo.Update(ctx, entity); err != nil {
 		return nil, fmt.Errorf("更新路由映射失败: %w", err)
 	}
+	InvalidateGatewayResponseCache(previousOperation, previousModelID)
+	InvalidateGatewayResponseCache(entity.Operation, entity.ModelID)
 	return s.routeRepo.GetByID(ctx, entity.ID)
 }
 
 func (s *modelRouteService) Delete(ctx context.Context, id uint) error {
-	return s.routeRepo.Delete(ctx, id)
+	existing, _ := s.routeRepo.GetByID(ctx, id)
+	if err := s.routeRepo.Delete(ctx, id); err != nil {
+		return err
+	}
+	if existing != nil {
+		InvalidateGatewayResponseCache(existing.Operation, existing.ModelID)
+	}
+	return nil
 }
 
 func (s *modelRouteService) GetByID(ctx context.Context, id uint) (*model.ModelRoute, error) {
@@ -216,7 +228,29 @@ func (s *modelRouteService) BatchUpdateEnabled(ctx context.Context, ids []uint, 
 	if len(filtered) == 0 {
 		return fmt.Errorf("ids 不能为空")
 	}
-	return s.routeRepo.BatchUpdateEnabled(ctx, filtered, enabled)
+	affectedRouteKeys := make(map[string]struct{}, len(filtered))
+	for _, id := range filtered {
+		existing, err := s.routeRepo.GetByID(ctx, id)
+		if err != nil {
+			return fmt.Errorf("加载路由映射失败: %w", err)
+		}
+		if existing == nil {
+			return fmt.Errorf("路由映射不存在: %d", id)
+		}
+		affectedRouteKeys[model.NormalizeOperation(existing.Operation)+":"+strings.TrimSpace(existing.ModelID)] = struct{}{}
+	}
+
+	if err := s.routeRepo.BatchUpdateEnabled(ctx, filtered, enabled); err != nil {
+		return err
+	}
+	for key := range affectedRouteKeys {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		InvalidateGatewayResponseCache(parts[0], parts[1])
+	}
+	return nil
 }
 
 func (s *modelRouteService) BatchUpdatePriority(ctx context.Context, items []ModelRoutePriorityItem) error {
@@ -235,6 +269,7 @@ func (s *modelRouteService) BatchUpdatePriority(ctx context.Context, items []Mod
 		updates[item.ID] = item.Priority
 	}
 
+	affectedRouteKeys := make(map[string]struct{}, len(items))
 	for id := range updates {
 		existing, err := s.routeRepo.GetByID(ctx, id)
 		if err != nil {
@@ -243,9 +278,20 @@ func (s *modelRouteService) BatchUpdatePriority(ctx context.Context, items []Mod
 		if existing == nil {
 			return fmt.Errorf("路由映射不存在: %d", id)
 		}
+		affectedRouteKeys[model.NormalizeOperation(existing.Operation)+":"+strings.TrimSpace(existing.ModelID)] = struct{}{}
 	}
 
-	return s.routeRepo.BatchUpdatePriority(ctx, updates)
+	if err := s.routeRepo.BatchUpdatePriority(ctx, updates); err != nil {
+		return err
+	}
+	for key := range affectedRouteKeys {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		InvalidateGatewayResponseCache(parts[0], parts[1])
+	}
+	return nil
 }
 
 func (s *modelRouteService) GetStats(ctx context.Context, operation string, modelID string) (*model.ModelRouteStats, error) {
