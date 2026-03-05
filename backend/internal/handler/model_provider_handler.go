@@ -120,6 +120,15 @@ type ProviderTestResult struct {
 	Message    string `json:"message,omitempty"`
 }
 
+type BatchHealthCheckRequest struct {
+	IDs []uint `json:"ids" binding:"required,min=1"`
+}
+
+type BatchProviderTestResult struct {
+	ProviderID uint `json:"provider_id"`
+	ProviderTestResult
+}
+
 // Create 鍒涘缓妯″瀷婧愬ご
 // @Summary 鍒涘缓妯″瀷婧愬ご
 // @Description 鍒涘缓鏂扮殑妯″瀷婧愬ご閰嶇疆
@@ -771,34 +780,99 @@ func (h *ModelProviderHandler) TestProvider(c *gin.Context) {
 		return
 	}
 
-	entity, err := h.providerService.GetEntityByID(c.Request.Context(), uint(id))
+	result, statusCode, err := h.executeProviderHealthCheck(c.Request.Context(), uint(id))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, model.ErrorResponse(model.ErrCodeInternalError, err.Error()))
-		return
-	}
-	if entity == nil || entity.Channel == nil {
-		c.JSON(http.StatusNotFound, model.ErrorResponse(model.ErrCodeNotFound, "源头不存在或缺少渠道信息"))
+		errCode := model.ErrCodeInternalError
+		if statusCode == http.StatusBadRequest {
+			errCode = model.ErrCodeInvalidRequest
+		}
+		if statusCode == http.StatusNotFound {
+			errCode = model.ErrCodeNotFound
+		}
+		c.JSON(statusCode, model.ErrorResponse(errCode, err.Error()))
 		return
 	}
 
-	testURL, err := buildOpenAIV1URL(entity.Channel.BaseURL, "/models")
-	if err != nil {
+	c.JSON(http.StatusOK, model.SuccessResponse(result))
+}
+
+// HealthCheck 源头健康检查（与 TestProvider 语义一致）
+// @Summary 源头健康检查
+// @Description 对指定源头发起最小探测请求（GET /v1/models）
+// @Tags 模型源头
+// @Param id path int true "源头ID"
+// @Success 200 {object} ProviderTestResult
+// @Router /api/admin/providers/{id}/health-check [get]
+func (h *ModelProviderHandler) HealthCheck(c *gin.Context) {
+	h.TestProvider(c)
+}
+
+// BatchHealthCheck 批量健康检查
+// @Summary 批量健康检查
+// @Description 批量探测多个源头连通性
+// @Tags 模型源头
+// @Accept json
+// @Produce json
+// @Param request body BatchHealthCheckRequest true "批量检查请求"
+// @Success 200 {object} map[string]interface{}
+// @Router /api/admin/providers/batch/health-check [post]
+func (h *ModelProviderHandler) BatchHealthCheck(c *gin.Context) {
+	var req BatchHealthCheckRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, model.ErrorResponse(model.ErrCodeInvalidRequest, err.Error()))
 		return
+	}
+
+	results := make([]BatchProviderTestResult, 0, len(req.IDs))
+	for _, providerID := range req.IDs {
+		item := BatchProviderTestResult{ProviderID: providerID}
+
+		result, _, err := h.executeProviderHealthCheck(c.Request.Context(), providerID)
+		if err != nil {
+			item.ProviderTestResult = ProviderTestResult{
+				OK:         false,
+				StatusCode: 0,
+				LatencyMs:  0,
+				Message:    err.Error(),
+			}
+		} else {
+			item.ProviderTestResult = *result
+		}
+
+		results = append(results, item)
+	}
+
+	c.JSON(http.StatusOK, model.SuccessResponse(gin.H{"results": results}))
+}
+
+func (h *ModelProviderHandler) executeProviderHealthCheck(ctx context.Context, providerID uint) (*ProviderTestResult, int, error) {
+	entity, err := h.providerService.GetEntityByID(ctx, providerID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	if entity == nil || entity.Channel == nil {
+		return nil, http.StatusNotFound, fmt.Errorf("源头不存在或缺少渠道信息")
+	}
+	return h.executeProviderEntityHealthCheck(ctx, entity)
+}
+
+func (h *ModelProviderHandler) executeProviderEntityHealthCheck(ctx context.Context, entity *model.ModelProvider) (*ProviderTestResult, int, error) {
+	testURL, err := buildOpenAIV1URL(entity.Channel.BaseURL, "/models")
+	if err != nil {
+		return nil, http.StatusBadRequest, err
 	}
 
 	timeoutMs := entity.AttemptTimeoutMs
 	if timeoutMs <= 0 {
 		timeoutMs = 5000
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(timeoutMs)*time.Millisecond)
+	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, testURL, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, model.ErrorResponse(model.ErrCodeInternalError, err.Error()))
-		return
+		return nil, http.StatusInternalServerError, err
 	}
 	if strings.TrimSpace(entity.Channel.APIKey) != "" {
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(entity.Channel.APIKey))
@@ -807,13 +881,12 @@ func (h *ModelProviderHandler) TestProvider(c *gin.Context) {
 	resp, err := http.DefaultClient.Do(req)
 	latencyMs := time.Since(start).Milliseconds()
 	if err != nil {
-		c.JSON(http.StatusOK, model.SuccessResponse(&ProviderTestResult{
+		return &ProviderTestResult{
 			OK:         false,
 			StatusCode: 0,
 			LatencyMs:  latencyMs,
 			Message:    err.Error(),
-		}))
-		return
+		}, http.StatusOK, nil
 	}
 	defer resp.Body.Close()
 
@@ -823,12 +896,12 @@ func (h *ModelProviderHandler) TestProvider(c *gin.Context) {
 		msg = "上游返回非 2xx: " + resp.Status
 	}
 
-	c.JSON(http.StatusOK, model.SuccessResponse(&ProviderTestResult{
+	return &ProviderTestResult{
 		OK:         ok,
 		StatusCode: resp.StatusCode,
 		LatencyMs:  latencyMs,
 		Message:    msg,
-	}))
+	}, http.StatusOK, nil
 }
 
 // RegisterRoutes 娉ㄥ唽璺敱
@@ -844,6 +917,8 @@ func (h *ModelProviderHandler) RegisterRoutes(router *gin.RouterGroup) {
 
 		// 连通性测试
 		providers.POST("/:id/test", h.TestProvider)
+		providers.GET("/:id/health-check", h.HealthCheck)
+		providers.POST("/batch/health-check", h.BatchHealthCheck)
 
 		// 鐘舵€佺鐞?
 		providers.POST("/:id/enable", h.Enable)

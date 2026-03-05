@@ -134,6 +134,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		circuitBreaker,
 		healthTracker,
 	)
+	providerCapabilityService := service.NewProviderCapabilityService(providerCapabilityRepo, modelProviderRepo)
 	adminTokenService, ok := tokenService.(service.AdminTokenService)
 	if !ok {
 		return nil, errors.New("token service 不支持管理员接口")
@@ -150,8 +151,10 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	audioHandler := handler.NewAudioHandler(audioService)
 
 	modelProviderHandler := handler.NewModelProviderHandler(modelProviderService, costCalculator)
+	providerMonitoringHandler := handler.NewProviderMonitoringHandler(modelProviderRepo, providerMetricsRepo)
 	providerInstanceHandler := handler.NewProviderInstanceHandler(providerInstanceRepo, runtimeStateStore)
 	modelCapabilityHandler := handler.NewModelCapabilityHandler(modelCapabilityRepo)
+	providerCapabilityHandler := handler.NewProviderCapabilityHandler(providerCapabilityService)
 	providerPricingRuleHandler := handler.NewProviderPricingRuleHandler(providerPricingRuleRepo)
 	providerRateLimitRuleHandler := handler.NewProviderRateLimitRuleHandler(providerRateLimitRuleRepo)
 	adminTokenHandler := handler.NewAdminTokenHandler(adminTokenService)
@@ -320,8 +323,10 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		adminAPI.POST("/assets/site", assetHandler.UploadSiteMaterial)
 
 		modelProviderHandler.RegisterRoutes(adminAPI)
+		providerMonitoringHandler.RegisterRoutes(adminAPI)
 		providerInstanceHandler.RegisterRoutes(adminAPI)
 		modelCapabilityHandler.RegisterRoutes(adminAPI)
+		providerCapabilityHandler.RegisterRoutes(adminAPI)
 		providerPricingRuleHandler.RegisterRoutes(adminAPI)
 		providerRateLimitRuleHandler.RegisterRoutes(adminAPI)
 		adminTokenHandler.RegisterRoutes(adminAPI)

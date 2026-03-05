@@ -13,3 +13,19 @@ type ProviderCapability struct {
 }
 
 func (ProviderCapability) TableName() string { return "provider_capabilities" }
+
+type ProviderCapabilitySummary struct {
+	ProviderID          uint           `json:"provider_id,omitempty"`
+	Total               int64          `json:"total"`
+	Enabled             int64          `json:"enabled"`
+	Disabled            int64          `json:"disabled"`
+	OperationBreakdown  map[string]int `json:"operation_breakdown"`
+}
+
+type ProviderCapabilityValidationResult struct {
+	ProviderID   uint   `json:"provider_id"`
+	Operation    string `json:"operation"`
+	CapabilityID uint   `json:"capability_id,omitempty"`
+	Matched      bool   `json:"matched"`
+	Reason       string `json:"reason,omitempty"`
+}
