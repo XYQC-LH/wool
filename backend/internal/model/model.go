@@ -159,3 +159,11 @@ type ModelPricing struct {
 	ContextLength   int             `json:"context_length"`
 	MaxOutputTokens int             `json:"max_output_tokens"`
 }
+
+type ModelAdminStats struct {
+	TotalModels      int64 `json:"total_models"`
+	EnabledModels    int64 `json:"enabled_models"`
+	DisabledModels   int64 `json:"disabled_models"`
+	ActiveModels     int64 `json:"active_models"`
+	DeprecatedModels int64 `json:"deprecated_models"`
+}

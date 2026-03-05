@@ -596,6 +596,34 @@ func (c *cascadeController) buildProvidersForDispatch(ctx context.Context, opera
 		return "", nil, err
 	}
 
+	routeProviders, err := c.resolveRouteProviders(ctx, operation, resolvedModelID)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(routeProviders) > 0 {
+		totalSourceCandidates := len(routeProviders)
+		matchedProviders := routeProviders
+		totalConstraintReject := 0
+
+		if c.capabilityMatcher != nil {
+			filtered, rejected, err := c.capabilityMatcher.MatchProviders(ctx, operation, routeProviders)
+			if err != nil {
+				return "", nil, fmt.Errorf("能力约束匹配失败(model=%s): %w", resolvedModelID, err)
+			}
+			totalConstraintReject = len(rejected)
+			matchedProviders = filtered
+		}
+
+		if len(matchedProviders) == 0 && totalSourceCandidates > 0 && totalConstraintReject >= totalSourceCandidates {
+			return resolvedModelID, nil, &ModelOperationNotSupportedError{
+				Operation: operation,
+				ModelID:   resolvedModelID,
+			}
+		}
+
+		return resolvedModelID, c.applyHealthGate(matchedProviders), nil
+	}
+
 	routeModels, err := c.resolveRouteModels(ctx, operation, resolvedModelID)
 	if err != nil {
 		return "", nil, err
@@ -673,6 +701,17 @@ func (c *cascadeController) resolveRouteModels(ctx context.Context, operation st
 		return []string{resolvedModelID}, nil
 	}
 	return routeModels, nil
+}
+
+func (c *cascadeController) resolveRouteProviders(ctx context.Context, operation string, resolvedModelID string) ([]*model.ModelProvider, error) {
+	if c.routeResolver == nil {
+		return nil, nil
+	}
+	providers, err := c.routeResolver.ResolveRouteProviders(ctx, operation, resolvedModelID)
+	if err != nil {
+		return nil, fmt.Errorf("解析路由源头失败: %w", err)
+	}
+	return providers, nil
 }
 
 func (c *cascadeController) applyHealthGate(providers []*model.ModelProvider) []*model.ModelProvider {

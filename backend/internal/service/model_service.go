@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"nexus-api/internal/model"
 	"nexus-api/internal/repository"
@@ -23,7 +24,10 @@ type ModelService interface {
 	Create(req *model.CreateModelRequest) (*model.ModelResponse, error)
 	Update(id string, req *model.UpdateModelRequest) (*model.ModelResponse, error)
 	Delete(id string) error
+	BatchDelete(ids []string) error
 	UpdateStatus(id string, enabled bool) error
+	BatchUpdateStatus(ids []string, enabled bool) error
+	GetAdminStats() (*model.ModelAdminStats, error)
 }
 
 // modelService 模型服务实现
@@ -190,10 +194,61 @@ func (s *modelService) Delete(id string) error {
 	return nil
 }
 
+func (s *modelService) BatchDelete(ids []string) error {
+	modelIDs := normalizeModelIDs(ids)
+	if len(modelIDs) == 0 {
+		return errors.New("ids 不能为空")
+	}
+	if err := s.modelRepo.BatchDelete(modelIDs); err != nil {
+		return fmt.Errorf("批量删除模型失败: %w", err)
+	}
+	return nil
+}
+
 // UpdateStatus 更新模型状态
 func (s *modelService) UpdateStatus(id string, enabled bool) error {
 	if err := s.modelRepo.UpdateStatus(id, enabled); err != nil {
 		return fmt.Errorf("更新模型状态失败: %w", err)
 	}
 	return nil
+}
+
+func (s *modelService) BatchUpdateStatus(ids []string, enabled bool) error {
+	modelIDs := normalizeModelIDs(ids)
+	if len(modelIDs) == 0 {
+		return errors.New("ids 不能为空")
+	}
+	if err := s.modelRepo.BatchUpdateStatus(modelIDs, enabled); err != nil {
+		return fmt.Errorf("批量更新模型状态失败: %w", err)
+	}
+	return nil
+}
+
+func (s *modelService) GetAdminStats() (*model.ModelAdminStats, error) {
+	stats, err := s.modelRepo.GetStats()
+	if err != nil {
+		return nil, fmt.Errorf("获取模型统计失败: %w", err)
+	}
+	return stats, nil
+}
+
+func normalizeModelIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	result := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, item := range ids {
+		id := strings.TrimSpace(item)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
 }

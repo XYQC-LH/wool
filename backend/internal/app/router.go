@@ -134,6 +134,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		circuitBreaker,
 		healthTracker,
 	)
+	modelRouteService := service.NewModelRouteService(modelRouteRepo, modelRepo, modelProviderRepo)
 	providerCapabilityService := service.NewProviderCapabilityService(providerCapabilityRepo, modelProviderRepo)
 	adminTokenService, ok := tokenService.(service.AdminTokenService)
 	if !ok {
@@ -154,6 +155,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 	providerMonitoringHandler := handler.NewProviderMonitoringHandler(modelProviderRepo, providerMetricsRepo)
 	providerInstanceHandler := handler.NewProviderInstanceHandler(providerInstanceRepo, runtimeStateStore)
 	modelCapabilityHandler := handler.NewModelCapabilityHandler(modelCapabilityRepo)
+	modelRouteHandler := handler.NewModelRouteHandler(modelRouteService)
 	providerCapabilityHandler := handler.NewProviderCapabilityHandler(providerCapabilityService)
 	providerPricingRuleHandler := handler.NewProviderPricingRuleHandler(providerPricingRuleRepo)
 	providerRateLimitRuleHandler := handler.NewProviderRateLimitRuleHandler(providerRateLimitRuleRepo)
@@ -272,6 +274,9 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 
 		adminAPI.GET("/models", adminHandler.ListModels)
 		adminAPI.POST("/models", adminHandler.CreateModel)
+		adminAPI.GET("/models/stats", adminHandler.GetModelStats)
+		adminAPI.POST("/models/batch/status", adminHandler.BatchUpdateModelStatus)
+		adminAPI.POST("/models/batch/delete", adminHandler.BatchDeleteModels)
 		adminAPI.GET("/models/:id", adminHandler.GetModel)
 		adminAPI.PUT("/models/:id", adminHandler.UpdateModel)
 		adminAPI.DELETE("/models/:id", adminHandler.DeleteModel)
@@ -326,6 +331,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB) (*gin.Engine, error) {
 		providerMonitoringHandler.RegisterRoutes(adminAPI)
 		providerInstanceHandler.RegisterRoutes(adminAPI)
 		modelCapabilityHandler.RegisterRoutes(adminAPI)
+		modelRouteHandler.RegisterRoutes(adminAPI)
 		providerCapabilityHandler.RegisterRoutes(adminAPI)
 		providerPricingRuleHandler.RegisterRoutes(adminAPI)
 		providerRateLimitRuleHandler.RegisterRoutes(adminAPI)

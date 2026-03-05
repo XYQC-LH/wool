@@ -16,10 +16,13 @@ type ModelRepository interface {
 	GetByID(id string) (*model.Model, error)
 	Update(m *model.Model) error
 	Delete(id string) error
+	BatchDelete(ids []string) error
 	List(page, pageSize int, filters map[string]interface{}) ([]*model.Model, int64, error)
 	ListAll() ([]*model.Model, error)
 	ListEnabled() ([]*model.Model, error)
 	UpdateStatus(id string, enabled bool) error
+	BatchUpdateStatus(ids []string, enabled bool) error
+	GetStats() (*model.ModelAdminStats, error)
 	GetPricing(id string) (*model.ModelPricing, error)
 	InvalidateCache()
 }
@@ -82,6 +85,21 @@ func (r *modelRepository) Delete(id string) error {
 	if err == nil {
 		r.InvalidateCache()
 		_ = cache.Delete(cache.KeyModelPrefix + id)
+	}
+	return err
+}
+
+func (r *modelRepository) BatchDelete(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	err := r.db.Delete(&model.Model{}, "id IN ?", ids).Error
+	if err == nil {
+		r.InvalidateCache()
+		for _, id := range ids {
+			_ = cache.Delete(cache.KeyModelPrefix + id)
+		}
 	}
 	return err
 }
@@ -172,6 +190,46 @@ func (r *modelRepository) UpdateStatus(id string, enabled bool) error {
 		_ = cache.Delete(cache.KeyModelPrefix + id)
 	}
 	return err
+}
+
+func (r *modelRepository) BatchUpdateStatus(ids []string, enabled bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	err := r.db.Model(&model.Model{}).Where("id IN ?", ids).Update("enabled", enabled).Error
+	if err == nil {
+		r.InvalidateCache()
+		for _, id := range ids {
+			_ = cache.Delete(cache.KeyModelPrefix + id)
+		}
+	}
+	return err
+}
+
+func (r *modelRepository) GetStats() (*model.ModelAdminStats, error) {
+	stats := &model.ModelAdminStats{}
+	buildQuery := func() *gorm.DB {
+		return r.db.Model(&model.Model{})
+	}
+
+	if err := buildQuery().Count(&stats.TotalModels).Error; err != nil {
+		return nil, err
+	}
+	if err := buildQuery().Where("enabled = ?", true).Count(&stats.EnabledModels).Error; err != nil {
+		return nil, err
+	}
+	if err := buildQuery().Where("enabled = ?", false).Count(&stats.DisabledModels).Error; err != nil {
+		return nil, err
+	}
+	if err := buildQuery().Where("status = ?", model.ModelStatusActive).Count(&stats.ActiveModels).Error; err != nil {
+		return nil, err
+	}
+	if err := buildQuery().Where("status = ?", model.ModelStatusDeprecated).Count(&stats.DeprecatedModels).Error; err != nil {
+		return nil, err
+	}
+
+	return stats, nil
 }
 
 // GetPricing 获取定价信息（通过模型名称）
